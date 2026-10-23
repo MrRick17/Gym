@@ -38,7 +38,7 @@ try:
     if gemini_api_key:
         genai.configure(api_key=gemini_api_key)
         # Usamos flash porque es rapidísimo y optimizado para texto/json
-        model = genai.GenerativeModel('gemini-1.5-flash') 
+        model = genai.GenerativeModel('gemini-pro')
         print("Motor IA Gemini inicializado.")
     else:
         print("ADVERTENCIA: Variable GEMINI_API_KEY no detectada.")
