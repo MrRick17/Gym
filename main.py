@@ -35,16 +35,9 @@ try:
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     if gemini_api_key:
         genai.configure(api_key=gemini_api_key)
-        
-        # Imprimir en los logs de Render los modelos compatibles con tu cuenta
-        print("--- MODELOS DISPONIBLES EN TU API KEY ---")
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                print(m.name)
-        print("------------------------------------------")
-        
+ 
         # Intentamos inicializar el modelo estándar
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         print("Motor IA Gemini inicializado correctamente.")
 except Exception as e:
     print(f"Error inicializando Gemini: {e}")
