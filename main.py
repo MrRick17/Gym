@@ -35,7 +35,7 @@ try:
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     if gemini_api_key:
         genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-3.8-flash')
         print("Motor IA Gemini inicializado correctamente.")
 except Exception as e:
     print(f"Error inicializando Gemini: {e}")
