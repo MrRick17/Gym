@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. CONEXIÓN SECRETA CON FIREBASE
+# 1. CONEXIÓN FIREBASE
 try:
     firebase_creds = os.environ.get("FIREBASE_CREDENTIALS")
     if firebase_creds:
@@ -29,7 +29,7 @@ try:
 except Exception as e:
     print(f"Error conectando a Firebase: {e}")
 
-# 2. CONEXIÓN SECRETA CON GEMINI IA
+# 2. CONEXIÓN GEMINI
 model = None
 try:
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
@@ -47,17 +47,24 @@ class ChatRequest(BaseModel):
     uid: str
     mensaje: str
 
+class ProgresoRequest(BaseModel):
+    uid: str
+    peso: float
+    fotos_b64: list[str] = []
+
 @app.get("/")
 def home():
-    return {"status": "online", "message": "El núcleo central de CORE está operativo."}
+    return {"status": "online", "message": "CORE Operativo."}
 
+# ==========================================
+# RUTINA Y NUTRICIÓN CENTRAL
+# ==========================================
 @app.post("/generar-rutina")
 def generar_rutina(req: RutinaRequest):
     global model
     try:
         user_ref = db.collection('usuarios').document(req.uid)
         user_doc = user_ref.get()
-        
         if not user_doc.exists:
             raise HTTPException(status_code=404, detail="Usuario no encontrado.")
             
@@ -70,33 +77,27 @@ def generar_rutina(req: RutinaRequest):
         edad = user_data.get('edad', 0)
 
         prompt = f"""
-        Actúa como un entrenador personal de élite y nutricionista deportivo avanzado.
-        Diseña un plan de entrenamiento estructurado exactamente para la frecuencia de **{frecuencia}** y una directriz nutricional precisa para este atleta:
-        - Edad: {edad} años
-        - Altura: {altura} cm
-        - Peso actual: {peso} kg
-        - Peso meta: {meta} kg
-        - Enfoque principal: {objetivo}
-        - Disponibilidad semanal: {frecuencia}
+        Actúa como un entrenador personal de élite. Diseña un plan estructurado para la frecuencia **{frecuencia}**:
+        - Peso actual: {peso} kg | Meta: {meta} kg | Enfoque: {objetivo}
 
-        Requisitos estrictos:
-        1. Si la frecuencia es 'Lunes a Viernes', genera exactamente 5 días. Si es 'Lunes a Sábado', genera exactamente 6 días.
-        2. CADA DÍA DEBE INDICAR CLARAMENTE LOS GRUPOS MUSCULARES TRABAJADOS en el título (Ejemplo: 'Día 1: Pecho y Tríceps', 'Día 2: Espalda y Bíceps').
-        3. Incluye ejercicios compuestos y de aislamiento con series y repeticiones profesionales (ej. 4x6-8).
-        4. La nutrición debe incluir directrices claras, calorías, y mención de alimentos limpios (arepas, pechuga de pollo, huevos, pasta y papas).
+        REGLAS ESTRICTAS:
+        1. Genera los días exactos según la frecuencia (5 o 6 días). Específica los grupos musculares en el título.
+        2. Ejercicios compuestos y de aislamiento con series/repeticiones.
+        3. LA NUTRICIÓN NO DEBE CONTENER PLATILLOS NI RECETAS. Debe ser una lista directa y estricta indicando:
+           - Fuentes de Proteínas, Carbohidratos y Grasas a consumir.
+           - Alimentos PROHIBIDOS (ej. azúcar, fritos).
+           - Resumen de Macros.
         
-        Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta, sin texto adicional, sin bloques de código markdown:
+        Devuelve ÚNICAMENTE un JSON válido con esta estructura:
         {{
             "rutina": [
-                {{"dia": "Día 1: Pecho y Tríceps (Lunes)", "ejercicios": ["Press de banca plano: 4x6-8", "Press inclinado con mancuernas: 3x8-10", "Aperturas en polea: 3x12", "Extensiones de tríceps en polea: 4x10-12"]}},
-                {{"dia": "Día 2: Espalda y Bíceps (Martes)", "ejercicios": ["Jalón al pecho: 4x8-10", "Remo con barra: 4x6-8", "Remo en polea baja: 3x10", "Curl con barra EZ: 3x10"]}}
+                {{"dia": "Día 1: Pecho y Tríceps", "ejercicios": ["Press de banca: 4x6-8", "Aperturas: 3x12"]}}
             ],
-            "nutricion": "Directriz nutricional detallada enfocada en tu objetivo, especificando macros y alimentos base (arepas, pechuga de pollo, huevos, pasta y papas)."
+            "nutricion": "✅ PERMITIDOS: Pechuga, huevos, arroz, pasta.\n❌ PROHIBIDOS: Azúcar, ultraprocesados.\n📊 MACROS: 160g Proteína, 200g Carbs, 60g Grasas."
         }}
         """
         
-        if model is None:
-            raise HTTPException(status_code=500, detail="El modelo de IA no está disponible.")
+        if model is None: raise HTTPException(status_code=500, detail="Modelo IA no disponible.")
 
         response = model.generate_content(prompt)
         texto_limpio = response.text.replace('```json', '').replace('```', '').strip()
@@ -106,13 +107,73 @@ def generar_rutina(req: RutinaRequest):
             'plan_entrenamiento': datos_ia['rutina'],
             'plan_nutricion': datos_ia['nutricion']
         })
-        
-        return {"status": "success", "message": "Plan analizado y actualizado exitosamente."}
-        
+        return {"status": "success", "message": "Plan optimizado."}
     except Exception as e:
-        print(f"Error procesando rutina: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==========================================
+# ESCÁNER BIOMÉTRICO (FOTOS + PESO)
+# ==========================================
+@app.post("/evaluar-progreso")
+def evaluar_progreso(req: ProgresoRequest):
+    global model
+    try:
+        user_ref = db.collection('usuarios').document(req.uid)
+        user_doc = user_ref.get()
+        if not user_doc.exists:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+            
+        # Preparar imágenes para la IA
+        contents = [
+            f"""
+            Actúa como un juez de culturismo y nutricionista. El usuario reporta un nuevo peso de {req.peso} kg y adjunta 3 fotos.
+            REGLA 1 (SEGURIDAD): Analiza las imágenes. Si NO son fotos de un cuerpo humano evaluable (ej. son memes, objetos, paisajes o fotos borrosas inservibles), detente y devuelve "error_fotos": true.
+            REGLA 2: Si las fotos son reales y válidas, evalúa visualmente el estado físico actual del atleta y el nuevo peso.
+            REGLA 3: Genera una nueva directriz de nutrición AJUSTADA (SIN PLATILLOS, SOLO QUÉ COMER, QUÉ NO COMER Y MACROS).
+            
+            Devuelve ÚNICAMENTE este JSON:
+            {{
+                "error_fotos": false,
+                "feedback_visual": "El texto de tu análisis físico. Ejemplo: 'Notables ganancias en deltoides, pero...'",
+                "nueva_nutricion": "✅ PERMITIDOS: ... \n❌ PROHIBIDOS: ... \n📊 MACROS: ..."
+            }}
+            """
+        ]
+        
+        for b64 in req.fotos_b64:
+            contents.append({"mime_type": "image/jpeg", "data": b64})
+
+        response = model.generate_content(contents)
+        texto_limpio = response.text.replace('```json', '').replace('```', '').strip()
+        datos_ia = json.loads(texto_limpio)
+        
+        if datos_ia.get("error_fotos") == True:
+            raise HTTPException(status_code=400, detail="Imágenes no válidas. Sube fotos reales de tu físico para el escáner.")
+
+        # Si todo es correcto, actualizamos la base de datos
+        user_data = user_doc.to_dict()
+        historial = user_data.get('historial_pesos', [])
+        historial.append(req.peso)
+        
+        user_ref.update({
+            'historial_pesos': historial,
+            'plan_nutricion': datos_ia['nueva_nutricion']
+        })
+        
+        return {
+            "status": "success", 
+            "feedback": datos_ia.get("feedback_visual", "Análisis completado exitosamente.")
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Error procesando fotos: {e}")
+        raise HTTPException(status_code=500, detail="Error analizando la biometría visual.")
+
+# ==========================================
+# CHAT ASISTENTE (JARVIS)
+# ==========================================
 @app.post("/chat")
 def chat_asistente(req: ChatRequest):
     global model
@@ -122,16 +183,8 @@ def chat_asistente(req: ChatRequest):
         nombre = user_data.get('nombre', 'Atleta')
         objetivo = user_data.get('objetivo', 'Hipertrofia')
         
-        chat_prompt = f"""
-        Eres Jarvis, el asistente de inteligencia artificial experto en fitness, nutrición y culturismo de la plataforma CORE Fitness.
-        Estás hablando con {nombre}, cuyo objetivo principal es {objetivo}.
-        Responde a su mensaje de forma motivadora, profesional, directa y concisa (máximo 3-4 frases o viñetas si es necesario):
-        Mensaje del usuario: {req.mensaje}
-        """
-        if model is None:
-            raise HTTPException(status_code=500, detail="Modelo no disponible.")
+        chat_prompt = f"Eres Jarvis, el asistente de IA de CORE Fitness. Hablas con {nombre} (Objetivo: {objetivo}). Responde a: {req.mensaje}. Sé directo, profesional y conciso."
         response = model.generate_content(chat_prompt)
         return {"status": "success", "respuesta": response.text.strip()}
     except Exception as e:
-        print(f"Error en chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
