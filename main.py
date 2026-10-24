@@ -29,17 +29,61 @@ try:
 except Exception as e:
     print(f"Error conectando a Firebase: {e}")
 
-# 2. CONEXIÓN GEMINI
-model = None
-try:
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    if gemini_api_key:
-        genai.configure(api_key=gemini_api_key)
-        # Usamos una temperatura más alta (0.7) para que no sea tan repetitivo y sea más creativo/personalizado
-        model = genai.GenerativeModel('gemini-3.8-flash', generation_config={"temperature": 0.7})
-        print("Motor IA Gemini inicializado correctamente.")
-except Exception as e:
-    print(f"Error inicializando Gemini: {e}")
+# ==========================================
+# SISTEMA DE ROTACIÓN DE CLAVES API (FALLBACK)
+# ==========================================
+GEMINI_KEYS = [
+    os.environ.get("GEMINI_API_KEY1"),
+    os.environ.get("GEMINI_API_KEY1"),
+    os.environ.get("GEMINI_API_KEY3")
+]
+# Filtrar claves nulas o vacías por si acaso
+GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
+current_key_index = 0
+
+def generar_con_rotacion(contenido):
+    """
+    Intenta generar contenido con la clave actual. 
+    Si da error de cuota (Quota/429), rota automáticamente a la siguiente clave.
+    Si las 3 fallan, lanza un error amigable.
+    """
+    global current_key_index
+    
+    if not GEMINI_KEYS:
+        # Fallback a la clave tradicional si no configuraste _1, _2, etc.
+        fallback_unico = os.environ.get("GEMINI_API_KEY")
+        if fallback_unico:
+            genai.configure(api_key=fallback_unico)
+            model = genai.GenerativeModel('gemini-3.8-flash', generation_config={"temperature": 0.7})
+            return model.generate_content(contenido)
+        raise HTTPException(status_code=500, detail="No hay claves API de Gemini configuradas.")
+    
+    intentos = 0
+    while intentos < len(GEMINI_KEYS):
+        try:
+            key_actual = GEMINI_KEYS[current_key_index]
+            genai.configure(api_key=key_actual)
+            model = genai.GenerativeModel('gemini-3.8-flash', generation_config={"temperature": 0.7})
+            
+            # Ejecutar llamada a la IA
+            return model.generate_content(contenido)
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            # Detectar errores de cuota superada (Quota, Resource Exhausted, Código 429)
+            if "quota" in error_str or "resource_exhausted" in error_str or "429" in error_str:
+                print(f"⚠️ Clave API en índice {current_key_index} agotada. Rotando a la siguiente...")
+                current_key_index = (current_key_index + 1) % len(GEMINI_KEYS)
+                intentos += 1
+            else:
+                # Si es otro tipo de error distinto a cuota, relanzarlo de inmediato
+                raise e
+                
+    # Si el bucle termina, significa que las 3 claves se agotaron
+    raise HTTPException(
+        status_code=429, 
+        detail="En este momento el sistema está procesando muchas solicitudes y las reservas de IA se han agotado temporalmente. Por favor, inténtalo más tarde."
+    )
 
 # --- MODELOS DE DATOS ---
 class RutinaRequest(BaseModel):
