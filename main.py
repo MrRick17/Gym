@@ -35,15 +35,17 @@ try:
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     if gemini_api_key:
         genai.configure(api_key=gemini_api_key)
- 
-        # Intentamos inicializar el modelo estándar
-        model = genai.GenerativeModel('gemini-3.8-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         print("Motor IA Gemini inicializado correctamente.")
 except Exception as e:
     print(f"Error inicializando Gemini: {e}")
 
 class RutinaRequest(BaseModel):
     uid: str
+
+class ChatRequest(BaseModel):
+    uid: str
+    mensaje: str
 
 @app.get("/")
 def home():
@@ -61,28 +63,35 @@ def generar_rutina(req: RutinaRequest):
             
         user_data = user_doc.to_dict()
         objetivo = user_data.get('objetivo', 'Recomposición')
+        frecuencia = user_data.get('dias_entrenamiento', 'Lunes a Viernes')
         peso = user_data.get('historial_pesos', [0])[-1]
         meta = user_data.get('peso_meta', 0)
         altura = user_data.get('altura', 0)
         edad = user_data.get('edad', 0)
 
         prompt = f"""
-        Actúa como un entrenador personal experto y nutricionista deportivo de élite.
-        Diseña una rutina semanal estructurada y una directriz nutricional para este cliente:
+        Actúa como un entrenador personal de élite y nutricionista deportivo avanzado.
+        Diseña un plan de entrenamiento estructurado exactamente para la frecuencia de **{frecuencia}** y una directriz nutricional precisa para este atleta:
         - Edad: {edad} años
         - Altura: {altura} cm
         - Peso actual: {peso} kg
         - Peso meta: {meta} kg
-        - Objetivo principal: {objetivo}
+        - Enfoque principal: {objetivo}
+        - Disponibilidad semanal: {frecuencia}
+
+        Requisitos estrictos:
+        1. Si la frecuencia es 'Lunes a Viernes', genera exactamente 5 días. Si es 'Lunes a Sábado', genera exactamente 6 días.
+        2. CADA DÍA DEBE INDICAR CLARAMENTE LOS GRUPOS MUSCULARES TRABAJADOS en el título (Ejemplo: 'Día 1: Pecho y Tríceps', 'Día 2: Espalda y Bíceps').
+        3. Incluye ejercicios compuestos y de aislamiento con series y repeticiones profesionales (ej. 4x6-8).
+        4. La nutrición debe incluir directrices claras, calorías, y mención de alimentos limpios (arepas, pechuga de pollo, huevos, pasta y papas).
         
-        Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta, sin texto adicional, sin bloque de código (markdown):
+        Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta, sin texto adicional, sin bloques de código markdown:
         {{
             "rutina": [
-                {{"dia": "Día 1: Upper Power", "ejercicios": ["Bench Press: 4x5", "Rows: 4x6"]}},
-                {{"dia": "Día 2: Lower Power", "ejercicios": ["Squats: 4x5", "Deadlifts: 3x5"]}},
-                {{"dia": "Día 3: Descanso Activo", "ejercicios": ["Cardio ligero 30 min"]}}
+                {{"dia": "Día 1: Pecho y Tríceps (Lunes)", "ejercicios": ["Press de banca plano: 4x6-8", "Press inclinado con mancuernas: 3x8-10", "Aperturas en polea: 3x12", "Extensiones de tríceps en polea: 4x10-12"]}},
+                {{"dia": "Día 2: Espalda y Bíceps (Martes)", "ejercicios": ["Jalón al pecho: 4x8-10", "Remo con barra: 4x6-8", "Remo en polea baja: 3x10", "Curl con barra EZ: 3x10"]}}
             ],
-            "nutricion": "Aquí tu directriz nutricional detallada con macros estimados, alimentos recomendados y calorías objetivo."
+            "nutricion": "Directriz nutricional detallada enfocada en tu objetivo, especificando macros y alimentos base (arepas, pechuga de pollo, huevos, pasta y papas)."
         }}
         """
         
@@ -102,4 +111,27 @@ def generar_rutina(req: RutinaRequest):
         
     except Exception as e:
         print(f"Error procesando rutina: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/chat")
+def chat_asistente(req: ChatRequest):
+    global model
+    try:
+        user_doc = db.collection('usuarios').document(req.uid).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        nombre = user_data.get('nombre', 'Atleta')
+        objetivo = user_data.get('objetivo', 'Hipertrofia')
+        
+        chat_prompt = f"""
+        Eres Jarvis, el asistente de inteligencia artificial experto en fitness, nutrición y culturismo de la plataforma CORE Fitness.
+        Estás hablando con {nombre}, cuyo objetivo principal es {objetivo}.
+        Responde a su mensaje de forma motivadora, profesional, directa y concisa (máximo 3-4 frases o viñetas si es necesario):
+        Mensaje del usuario: {req.mensaje}
+        """
+        if model is None:
+            raise HTTPException(status_code=500, detail="Modelo no disponible.")
+        response = model.generate_content(chat_prompt)
+        return {"status": "success", "respuesta": response.text.strip()}
+    except Exception as e:
+        print(f"Error en chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
