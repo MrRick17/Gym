@@ -44,6 +44,13 @@ except Exception as e:
 class RutinaRequest(BaseModel):
     uid: str
 
+class RegistroBioRequest(BaseModel):
+    uid: str
+    peso: float
+    frecuencia: str
+    objetivo: str
+    fotos_b64: list[str]
+
 class ProgresoRequest(BaseModel):
     uid: str
     peso: float
@@ -67,7 +74,55 @@ def home():
     return {"status": "online"}
 
 # ==========================================
-# 1. RUTINA ESTÁNDAR (Botón Recalibrar de la pestaña Plan)
+# 1. ANÁLISIS INICIAL (AL REGISTRARSE)
+# ==========================================
+@app.post("/analisis-registro")
+def analisis_registro(req: RegistroBioRequest):
+    global model
+    try:
+        user_ref = db.collection('usuarios').document(req.uid)
+        
+        contents = [
+            f"""
+            Eres el núcleo de IA de CORE Fitness. Un nuevo atleta acaba de registrarse.
+            - Peso inicial: {req.peso} kg
+            - Frecuencia: {req.frecuencia}
+            - Objetivo: {req.objetivo}
+            
+            REGLA 1: Analiza las fotos adjuntas. Si NO son fotos de un cuerpo humano evaluable, devuelve {{"error_fotos": true}}.
+            REGLA 2: Si son válidas, evalúa su físico inicial y diseña su PRIMERA RUTINA ({req.frecuencia} indicando músculos) y su PRIMERA NUTRICIÓN ESTRICTA (Sin recetas, solo proteínas, carbs, grasas, alimentos prohibidos y macros).
+            
+            Devuelve ÚNICAMENTE este JSON:
+            {{
+                "error_fotos": false,
+                "rutina": [ {{"dia": "Día 1: Pecho y Tríceps", "ejercicios": ["Press de banca: 4x8"]}} ],
+                "nutricion": "✅ PERMITIDOS: ...\\n❌ PROHIBIDOS: ...\\n📊 MACROS: ..."
+            }}
+            """
+        ]
+        
+        for b64 in req.fotos_b64:
+            contents.append({"mime_type": "image/jpeg", "data": b64})
+
+        response = model.generate_content(contents)
+        datos_ia = json.loads(response.text.replace('```json', '').replace('```', '').strip())
+        
+        if datos_ia.get("error_fotos") == True:
+            return {"status": "warning", "message": "Atleta registrado, pero las imágenes fueron rechazadas por el escáner."}
+
+        user_ref.update({
+            'plan_entrenamiento': datos_ia['rutina'],
+            'plan_nutricion': datos_ia['nutricion']
+        })
+        
+        return {"status": "success", "message": "Biometría inicial analizada y plan generado."}
+        
+    except Exception as e:
+        print(f"Error en análisis de registro: {e}")
+        raise HTTPException(status_code=500, detail="Error procesando la biometría inicial.")
+
+# ==========================================
+# 2. RUTINA ESTÁNDAR (Botón Recalibrar de la pestaña Plan)
 # ==========================================
 @app.post("/generar-rutina")
 def generar_rutina(req: RutinaRequest):
@@ -103,7 +158,7 @@ def generar_rutina(req: RutinaRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# 2. INICIO DE ESCÁNER BIOMÉTRICO (Analiza pero NO guarda el plan aún)
+# 3. ESCÁNER BIOMÉTRICO (PROGRESO)
 # ==========================================
 @app.post("/evaluar-progreso")
 def evaluar_progreso(req: ProgresoRequest):
@@ -131,7 +186,6 @@ def evaluar_progreso(req: ProgresoRequest):
         if datos_ia.get("error_fotos") == True:
             raise HTTPException(status_code=400, detail="Sube fotos reales de tu físico.")
 
-        # Solo actualizamos el historial de pesos para la gráfica
         user_data = user_doc.to_dict()
         historial = user_data.get('historial_pesos', [])
         historial.append(req.peso)
@@ -142,7 +196,7 @@ def evaluar_progreso(req: ProgresoRequest):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# 3. CHAT BIOMÉTRICO (Conversación intermedia)
+# 4. CHAT BIOMÉTRICO (Conversación intermedia)
 # ==========================================
 @app.post("/chat-biometrico")
 def chat_biometrico(req: BioChatRequest):
@@ -162,7 +216,7 @@ def chat_biometrico(req: BioChatRequest):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# 4. GUARDAR Y APLICAR AJUSTES FINALES
+# 5. GUARDAR Y APLICAR AJUSTES FINALES
 # ==========================================
 @app.post("/aplicar-plan-biometrico")
 def aplicar_plan(req: AplicarPlanRequest):
@@ -197,8 +251,20 @@ def aplicar_plan(req: AplicarPlanRequest):
         return {"status": "success"}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
-# El Chat Global Jarvis de la otra pestaña se mantiene igual
+# ==========================================
+# 6. CHAT JARVIS GLOBAL
+# ==========================================
 @app.post("/chat")
 def chat_asistente(req: BioChatRequest):
-    # ... (Mismo código que ya tenías para el chat global)
-    return {"status": "success", "respuesta": "Módulo de chat global activo."}
+    global model
+    try:
+        user_doc = db.collection('usuarios').document(req.uid).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        nombre = user_data.get('nombre', 'Atleta')
+        objetivo = user_data.get('objetivo', 'Hipertrofia')
+        
+        chat_prompt = f"Eres Jarvis, el asistente de IA de CORE Fitness. Hablas con {nombre} (Objetivo: {objetivo}). Responde a: {req.nuevo_mensaje}. Sé directo, profesional y conciso."
+        response = model.generate_content(chat_prompt)
+        return {"status": "success", "respuesta": response.text.strip()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
