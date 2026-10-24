@@ -35,7 +35,8 @@ try:
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     if gemini_api_key:
         genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel('gemini-3.8-flash')
+        # Usamos una temperatura más alta (0.7) para que no sea tan repetitivo y sea más creativo/personalizado
+        model = genai.GenerativeModel('gemini-3.8-flash', generation_config={"temperature": 0.7})
         print("Motor IA Gemini inicializado correctamente.")
 except Exception as e:
     print(f"Error inicializando Gemini: {e}")
@@ -49,6 +50,7 @@ class RegistroBioRequest(BaseModel):
     peso: float
     frecuencia: str
     objetivo: str
+    genero: str
     fotos_b64: list[str]
 
 class ProgresoRequest(BaseModel):
@@ -84,15 +86,20 @@ def analisis_registro(req: RegistroBioRequest):
         
         contents = [
             f"""
-            Eres el núcleo de IA de CORE Fitness. Un nuevo atleta acaba de registrarse.
+            Eres el entrenador de élite y nutricionista de CORE Fitness. Genera un plan inicial TOTALMENTE PERSONALIZADO.
+            PERFIL DEL ATLETA:
+            - Género: {req.genero}
             - Peso inicial: {req.peso} kg
             - Frecuencia: {req.frecuencia}
             - Objetivo: {req.objetivo}
             
-            REGLA 1: Analiza las fotos adjuntas. Si NO son fotos de un cuerpo humano evaluable, devuelve {{"error_fotos": true}}.
-            REGLA 2: Si son válidas, evalúa su físico inicial y diseña su PRIMERA RUTINA ({req.frecuencia} indicando músculos) y su PRIMERA NUTRICIÓN ESTRICTA (Sin recetas, solo proteínas, carbs, grasas, alimentos prohibidos y macros).
+            REGLAS DE PERSONALIZACIÓN ESTRICTA:
+            1. Analiza las fotos para evaluar el punto de partida físico (Si no son de un humano, devuelve "error_fotos": true).
+            2. Si el objetivo es 'Volumen': Enfoca la rutina en cargas pesadas, repeticiones de 6-10, descansos largos y superávit calórico.
+            3. Si el objetivo es 'Definición': Enfoca la rutina en intensidad, repeticiones de 10-15, agrega CARDIO HIIT al final y déficit calórico estricto.
+            4. NUTRICIÓN: Prohibido dar recetas. Solo da las proteínas, carbohidratos, grasas limpias sugeridas para un {req.genero} de {req.peso}kg, qué evitar y los macros diarios exactos.
             
-            Devuelve ÚNICAMENTE este JSON:
+            Devuelve ÚNICAMENTE JSON VÁLIDO (sin markdown):
             {{
                 "error_fotos": false,
                 "rutina": [ {{"dia": "Día 1: Pecho y Tríceps", "ejercicios": ["Press de banca: 4x8"]}} ],
@@ -108,21 +115,16 @@ def analisis_registro(req: RegistroBioRequest):
         datos_ia = json.loads(response.text.replace('```json', '').replace('```', '').strip())
         
         if datos_ia.get("error_fotos") == True:
-            return {"status": "warning", "message": "Atleta registrado, pero las imágenes fueron rechazadas por el escáner."}
+            return {"status": "warning", "message": "Atleta registrado, pero las fotos fueron rechazadas."}
 
-        user_ref.update({
-            'plan_entrenamiento': datos_ia['rutina'],
-            'plan_nutricion': datos_ia['nutricion']
-        })
-        
-        return {"status": "success", "message": "Biometría inicial analizada y plan generado."}
+        user_ref.update({'plan_entrenamiento': datos_ia['rutina'], 'plan_nutricion': datos_ia['nutricion']})
+        return {"status": "success", "message": "Biometría analizada y plan generado."}
         
     except Exception as e:
-        print(f"Error en análisis de registro: {e}")
         raise HTTPException(status_code=500, detail="Error procesando la biometría inicial.")
 
 # ==========================================
-# 2. RUTINA ESTÁNDAR (Botón Recalibrar de la pestaña Plan)
+# 2. RUTINA ESTÁNDAR (Botón Recalibrar)
 # ==========================================
 @app.post("/generar-rutina")
 def generar_rutina(req: RutinaRequest):
@@ -130,19 +132,24 @@ def generar_rutina(req: RutinaRequest):
     try:
         user_ref = db.collection('usuarios').document(req.uid)
         user_doc = user_ref.get()
-        if not user_doc.exists: raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+        if not user_doc.exists: raise HTTPException(status_code=404)
             
         user_data = user_doc.to_dict()
         objetivo = user_data.get('objetivo', 'Recomposición')
         frecuencia = user_data.get('dias_entrenamiento', 'Lunes a Viernes')
         peso = user_data.get('historial_pesos', [0])[-1]
+        genero = user_data.get('genero', 'Desconocido')
+        edad = user_data.get('edad', 20)
 
         prompt = f"""
-        Actúa como entrenador de élite. Plan para {frecuencia}. Peso: {peso}kg. Enfoque: {objetivo}.
-        REGLAS:
-        1. Genera los días exactos según la frecuencia. Grupos musculares en el título.
-        2. Ejercicios compuestos y aislamiento con series/repeticiones.
-        3. NUTRICIÓN DIRECTA Y ESTRICTA. CERO RECETAS O PLATILLOS. Solo lista de proteínas, carbohidratos, grasas permitidas, alimentos prohibidos y resumen de macros.
+        Actúa como entrenador de élite. Rediseña un plan TOTALMENTE ÚNICO para este atleta.
+        ATLETA: {genero}, {edad} años, {peso} kg. Frecuencia: {frecuencia}. Objetivo principal: {objetivo}.
+
+        REGLAS DE PERSONALIZACIÓN ESTRICTA:
+        1. No repitas rutinas genéricas. Adapta los ejercicios a un {genero}.
+        2. Si el objetivo es 'Volumen': Usa rangos de fuerza/hipertrofia (6-10 reps) y levantamientos pesados.
+        3. Si el objetivo es 'Definición': Usa rangos de resistencia/hipertrofia (10-15 reps), agrega trabajo cardiovascular y pliométrico.
+        4. NUTRICIÓN: Cero recetas. Solo fuentes de macros, restricciones y cantidad de calorías/macros exactos según su peso y objetivo.
         
         Devuelve ÚNICAMENTE JSON:
         {{
@@ -167,15 +174,17 @@ def evaluar_progreso(req: ProgresoRequest):
         user_ref = db.collection('usuarios').document(req.uid)
         user_doc = user_ref.get()
         if not user_doc.exists: raise HTTPException(status_code=404)
+        
+        user_data = user_doc.to_dict()
+        genero = user_data.get('genero', 'Desconocido')
             
         contents = [
             f"""
-            Eres Jarvis, analista físico. El usuario reporta {req.peso} kg.
-            REGLA 1: Si NO son fotos de un cuerpo humano evaluable, devuelve {{"error_fotos": true}}.
-            REGLA 2: Si son válidas, evalúa visualmente.
-            REGLA 3: Termina el análisis PREGUNTÁNDOLE al usuario qué grupo muscular quiere priorizar o qué prefiere ajustar, para adaptar su nueva rutina y dieta.
-            Devuelve ÚNICAMENTE JSON:
-            {{ "error_fotos": false, "feedback_visual": "Tu análisis y tu pregunta final aquí." }}
+            Eres Jarvis, analista visual. Atleta: {genero}, {req.peso} kg.
+            REGLA 1: Si no hay cuerpo humano evaluable, devuelve {{"error_fotos": true}}.
+            REGLA 2: Analiza el porcentaje de grasa y masa muscular basado en las imágenes y su género.
+            REGLA 3: Termina preguntándole al usuario de forma natural (máx 2 líneas) qué aspecto muscular desea priorizar este mes para recalibrar.
+            Devuelve JSON: {{ "error_fotos": false, "feedback_visual": "Tu análisis..." }}
             """
         ]
         for b64 in req.fotos_b64: contents.append({"mime_type": "image/jpeg", "data": b64})
@@ -186,7 +195,6 @@ def evaluar_progreso(req: ProgresoRequest):
         if datos_ia.get("error_fotos") == True:
             raise HTTPException(status_code=400, detail="Sube fotos reales de tu físico.")
 
-        user_data = user_doc.to_dict()
         historial = user_data.get('historial_pesos', [])
         historial.append(req.peso)
         user_ref.update({'historial_pesos': historial})
@@ -196,27 +204,20 @@ def evaluar_progreso(req: ProgresoRequest):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# 4. CHAT BIOMÉTRICO (Conversación intermedia)
+# 4. CHAT BIOMÉTRICO
 # ==========================================
 @app.post("/chat-biometrico")
 def chat_biometrico(req: BioChatRequest):
     global model
     try:
         conversacion = "\n".join([f"{m.role}: {m.content}" for m in req.historial])
-        prompt = f"""
-        Eres Jarvis. Estás en medio de un análisis físico con el atleta.
-        Historial de charla:
-        {conversacion}
-        Atleta: {req.nuevo_mensaje}
-        
-        Responde brevemente confirmando que tomarás en cuenta su petición para el nuevo plan.
-        """
+        prompt = f"Eres Jarvis. Estás en un análisis físico. Historial:\n{conversacion}\nAtleta: {req.nuevo_mensaje}\nResponde en 1 línea confirmando que tomarás esto en cuenta para generar el plan. Sé carismático."
         response = model.generate_content(prompt)
         return {"status": "success", "respuesta": response.text.strip()}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# 5. GUARDAR Y APLICAR AJUSTES FINALES
+# 5. APLICAR PLAN BIOMÉTRICO
 # ==========================================
 @app.post("/aplicar-plan-biometrico")
 def aplicar_plan(req: AplicarPlanRequest):
@@ -227,16 +228,19 @@ def aplicar_plan(req: AplicarPlanRequest):
         
         frecuencia = user_data.get('dias_entrenamiento', 'Lunes a Viernes')
         peso = user_data.get('historial_pesos', [0])[-1]
+        objetivo = user_data.get('objetivo', 'Volumen')
+        genero = user_data.get('genero', 'Desconocido')
         conversacion = "\n".join([f"{m.role}: {m.content}" for m in req.historial])
 
         prompt = f"""
-        Actúa como entrenador de élite. Diseña la rutina de {frecuencia} FINAL basada en esta charla biométrica:
+        Actúa como entrenador de élite. Diseña la rutina FINAL para un {genero} de {peso}kg ({frecuencia}) basada en sus peticiones:
+        Peticiones del atleta:
         {conversacion}
-        Peso actual: {peso}kg.
         
         REGLAS:
-        1. Adapta la rutina estrictamente a lo que el atleta pidió priorizar en la charla.
-        2. NUTRICIÓN STRICTA (0 recetas). Solo proteínas, carbs, grasas permitidas, alimentos prohibidos y macros.
+        1. OBJETIVO ACTUAL: {objetivo}. Si es Volumen, menos reps y más peso. Si es Definición, más reps y cardio al final.
+        2. ADAPTABILIDAD: Integra ESTRICTAMENTE lo que el atleta pidió priorizar en la charla.
+        3. NUTRICIÓN EXACTA: Cero recetas. Macros ajustados a su género, peso y peticiones.
         
         Devuelve ÚNICAMENTE JSON:
         {{
@@ -261,9 +265,10 @@ def chat_asistente(req: BioChatRequest):
         user_doc = db.collection('usuarios').document(req.uid).get()
         user_data = user_doc.to_dict() if user_doc.exists else {}
         nombre = user_data.get('nombre', 'Atleta')
-        objetivo = user_data.get('objetivo', 'Hipertrofia')
+        objetivo = user_data.get('objetivo', 'Volumen')
+        genero = user_data.get('genero', 'Atleta')
         
-        chat_prompt = f"Eres Jarvis, el asistente de IA de CORE Fitness. Hablas con {nombre} (Objetivo: {objetivo}). Responde a: {req.nuevo_mensaje}. Sé directo, profesional y conciso."
+        chat_prompt = f"Eres Jarvis, el asistente de IA de CORE Fitness. Hablas con {nombre} ({genero}, Objetivo: {objetivo}). Responde a: {req.nuevo_mensaje}. Sé directo, motivacional, sin redundancias y no uses formato JSON."
         response = model.generate_content(chat_prompt)
         return {"status": "success", "respuesta": response.text.strip()}
     except Exception as e:
