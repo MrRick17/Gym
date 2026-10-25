@@ -1,6 +1,6 @@
-fastapi
-uvicorn[standard]
-pydantic>=2
-firebase-admin
-google-genai
-pillow
+   fastapi
+   uvicorn[standard]
+   pydantic>=2
+   firebase-admin
+   google-genai
+   pillow
