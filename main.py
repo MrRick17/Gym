@@ -321,6 +321,7 @@ ENTRENAMIENTO:
 - 10-20 series semanales por grupo muscular grande; con 4 o más días, cada grupo grande al menos 2 veces por semana.
 - Adapta a género, edad (desde los 45 prioriza ejercicios amigables con las articulaciones), nivel, equipamiento y lesiones. Prioriza lo que pidió el atleta.
 - Formato de cada ejercicio, en una línea: "Nombre: SERIESxREPS · DESCANSOs · RIR n" (ej: "Press banca con barra: 4x6-8 · 120s · RIR 2"). El primer ejercicio de cada día es "Calentamiento: 8 min + series de aproximación".
+- Nombra cada día así: si la disponibilidad indica días concretos de la semana, usa "Lunes: enfoque" con esos días reales; si no, "Día N: enfoque".
 NOTAS: 3-4 líneas sobre progresión (doble progresión), técnica y deload cada 5-6 semanas.
 Devuelve ÚNICAMENTE JSON: {{"rutina": [{{"dia": "Día 1: Torso (empuje)", "ejercicios": ["..."]}}], "notas": "..."}}"""
     p_nutri = base + """
@@ -524,3 +525,18 @@ def chat_stream(req: BioChatRequest, s=Depends(activo)):
             yield t
         _guardar_chat(ref, prev, msg, "".join(partes).strip())
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.get("/diagnostico")
+def diagnostico(k: str = ""):
+    """Comprobación rápida de Firebase y Gemini. Solo responde si defines la variable DIAG_KEY en Render."""
+    clave = os.environ.get("DIAG_KEY")
+    if not clave or k != clave:
+        raise HTTPException(404, "No encontrado.")
+    out = {"firebase": db is not None, "claves_gemini": len(CLIENTS), "modelo": MODEL, "origenes_permitidos": ORIGINS}
+    try:
+        out["gemini"] = "OK: " + ia("Responde solo: ok", nivel=THINK_CHAT).strip()[:40]
+    except HTTPException as e:
+        out["gemini"] = f"ERROR {e.status_code}: {e.detail}"
+    except Exception as e:
+        out["gemini"] = f"ERROR {type(e).__name__}: {str(e)[:300]}"
+    return out
