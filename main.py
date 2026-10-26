@@ -152,6 +152,11 @@ def activo(tok=Depends(sesion)):
             raise HTTPException(403, "Suscripción inactiva.")
     return tok, ref, d
 
+DEBUG = os.environ.get("DEBUG_ERRORS") == "1"
+def fallo(msg, e):
+    """Error 500 genérico; con DEBUG_ERRORS=1 añade el motivo real (solo para depurar)."""
+    return HTTPException(500, f"{msg} [{type(e).__name__}: {str(e)[:240]}]" if DEBUG else msg)
+
 _hits = {}
 def limite(uid, n=12, ventana=60):
     ahora = time.time()
@@ -382,7 +387,7 @@ def analisis_registro(req: RegistroBioRequest, s=Depends(basico)):
         raise
     except Exception as e:
         print(f"analisis-registro: {e}")
-        raise HTTPException(500, "Error procesando la biometría inicial.")
+        raise fallo("Error procesando la biometría inicial.", e)
 
 @app.post("/generar-rutina")
 def generar_rutina(req: RutinaRequest, s=Depends(activo)):
@@ -395,7 +400,7 @@ def generar_rutina(req: RutinaRequest, s=Depends(activo)):
         raise
     except Exception as e:
         print(f"generar-rutina: {e}")
-        raise HTTPException(500, "No se pudo generar la rutina.")
+        raise fallo("No se pudo generar la rutina.", e)
 
 @app.post("/evaluar-progreso")
 def evaluar_progreso(req: ProgresoRequest, s=Depends(activo)):
@@ -424,7 +429,7 @@ def evaluar_progreso(req: ProgresoRequest, s=Depends(activo)):
         raise
     except Exception as e:
         print(f"evaluar-progreso: {e}")
-        raise HTTPException(500, "No se pudo evaluar el progreso.")
+        raise fallo("No se pudo evaluar el progreso.", e)
 
 def _convo(h):
     return "\n".join(f"{m.role}: {m.content[:600]}" for m in h[-12:])
@@ -442,7 +447,7 @@ def chat_biometrico(req: BioChatRequest, s=Depends(activo)):
         raise
     except Exception as e:
         print(f"chat-biometrico: {e}")
-        raise HTTPException(500, "No pude responder ahora.")
+        raise fallo("No pude responder ahora.", e)
 
 @app.post("/aplicar-plan-biometrico")
 def aplicar_plan(req: AplicarPlanRequest, s=Depends(activo)):
@@ -455,7 +460,7 @@ def aplicar_plan(req: AplicarPlanRequest, s=Depends(activo)):
         raise
     except Exception as e:
         print(f"aplicar-plan: {e}")
-        raise HTTPException(500, "No se pudo aplicar el plan.")
+        raise fallo("No se pudo aplicar el plan.", e)
 
 def _chat_ctx(d):
     plan = [f"{x.get('dia')}: " + ", ".join(e.split(":")[0] for e in x.get("ejercicios", [])[:8]) for x in (d.get("plan_entrenamiento") or [])]
@@ -497,7 +502,7 @@ def chat_asistente(req: BioChatRequest, s=Depends(activo)):
         raise
     except Exception as e:
         print(f"chat: {e}")
-        raise HTTPException(500, "No pude responder ahora.")
+        raise fallo("No pude responder ahora.", e)
 
 @app.post("/chat-stream")
 def chat_stream(req: BioChatRequest, s=Depends(activo)):
@@ -515,7 +520,7 @@ def chat_stream(req: BioChatRequest, s=Depends(activo)):
         raise HTTPException(502, "Respuesta vacía.")
     except Exception as e:
         print(f"chat-stream: {e}")
-        raise HTTPException(500, "No pude responder ahora.")
+        raise fallo("No pude responder ahora.", e)
 
     def gen():
         partes = [primero]
