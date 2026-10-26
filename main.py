@@ -1,6 +1,6 @@
 import os, io, re, json, time, base64, threading
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import firebase_admin
@@ -37,7 +37,7 @@ def get_db():
 # ---------- Gemini (google-genai): reparto entre claves, enfriamiento, reintentos y modelo de respaldo ----------
 KEYS = list(dict.fromkeys(k for k in (os.environ.get("GEMINI_API_KEY1"), os.environ.get("GEMINI_API_KEY2"),
                                       os.environ.get("GEMINI_API_KEY3"), os.environ.get("GEMINI_API_KEY")) if k))
-TIMEOUT_MS = int(os.environ.get("IA_TIMEOUT_MS", "60000"))
+TIMEOUT_MS = int(os.environ.get("IA_TIMEOUT_MS", "90000"))
 
 def _cliente(k):
     try:
@@ -384,7 +384,7 @@ MACROS DIARIOS FIJOS (úsalos EXACTAMENTE): {mac['kcal']} kcal | Proteína {mac[
 
 ENTRENAMIENTO:
 - Exactamente {dias} días de entrenamiento, estructura {split}. Pautas: {pautas}.
-- 5-7 ejercicios por día: compuestos primero, aislamiento después, core o cardio al final. Varía ejercicios entre días y evita rutinas genéricas.
+- 5-6 ejercicios por día (sin contar el calentamiento): compuestos primero, aislamiento después, core o cardio al final. Varía ejercicios entre días y evita rutinas genéricas.
 - 10-20 series semanales por grupo muscular grande; con 4 o más días, cada grupo grande al menos 2 veces por semana.
 - Adapta a género, edad (desde los 45 prioriza ejercicios amigables con las articulaciones), nivel, equipamiento y lesiones. Prioriza lo que pidió el atleta.
 - Formato de cada ejercicio, en una línea: "Nombre: SERIESxREPS · DESCANSOs · RIR n" (ej: "Press banca con barra: 4x6-8 · 120s · RIR 2"). El primer ejercicio de cada día es "Calentamiento: 8 min + series de aproximación".
@@ -459,18 +459,47 @@ def analisis_registro(req: RegistroBioRequest, s=Depends(basico)):
         print(f"analisis-registro: {e}")
         raise fallo("Error procesando la biometría inicial.", e)
 
-@app.post("/generar-rutina")
-def generar_rutina(req: RutinaRequest, s=Depends(activo)):
-    tok, ref, d = s
-    limite(tok["uid"], 4, 300)
+def _estado(ref, jid, estado, msg=""):
     try:
-        generar_plan(ref, d)
-        return {"status": "success"}
-    except HTTPException:
-        raise
+        ref.update({"plan_estado": {"id": jid, "estado": estado, "mensaje": msg[:200], "ts": int(time.time() * 1000)}})
     except Exception as e:
-        print(f"generar-rutina: {e}")
-        raise fallo("No se pudo generar la rutina.", e)
+        print(f"plan_estado: {e}")
+
+def _trabajo_plan(ref, d, jid, **kw):
+    """Corre en segundo plano: reintenta si la IA falla y deja el resultado en Firestore para que el front lo lea."""
+    msg = "No se pudo generar el plan. Inténtalo de nuevo."
+    for intento in (0, 1):
+        try:
+            generar_plan(ref, d, **kw)
+            return _estado(ref, jid, "listo")
+        except HTTPException as e:
+            msg = str(e.detail)
+            if e.status_code in (502, 503) and intento == 0:
+                time.sleep(3)
+                continue
+            break
+        except Exception as e:
+            print(f"plan (intento {intento + 1}): {e}")
+            if intento == 0:
+                time.sleep(3)
+                continue
+            break
+    _estado(ref, jid, "error", msg)
+
+def _iniciar_plan(bg, ref, d, tok, **kw):
+    est = d.get("plan_estado") or {}
+    if est.get("estado") == "generando" and time.time() * 1000 - est.get("ts", 0) < 240000:
+        return {"status": "en_curso", "job": est.get("id")}
+    limite(tok["uid"], 4, 300)
+    jid = str(int(time.time() * 1000))
+    _estado(ref, jid, "generando")
+    bg.add_task(_trabajo_plan, ref, d, jid, **kw)
+    return {"status": "iniciado", "job": jid}
+
+@app.post("/generar-rutina")
+def generar_rutina(req: RutinaRequest, bg: BackgroundTasks, s=Depends(activo)):
+    tok, ref, d = s
+    return _iniciar_plan(bg, ref, d, tok)
 
 @app.post("/evaluar-progreso")
 def evaluar_progreso(req: ProgresoRequest, s=Depends(activo)):
@@ -520,17 +549,9 @@ def chat_biometrico(req: BioChatRequest, s=Depends(activo)):
         raise fallo("No pude responder ahora.", e)
 
 @app.post("/aplicar-plan-biometrico")
-def aplicar_plan(req: AplicarPlanRequest, s=Depends(activo)):
+def aplicar_plan(req: AplicarPlanRequest, bg: BackgroundTasks, s=Depends(activo)):
     tok, ref, d = s
-    limite(tok["uid"], 4, 300)
-    try:
-        generar_plan(ref, d, extra=_convo(req.historial))
-        return {"status": "success"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"aplicar-plan: {e}")
-        raise fallo("No se pudo aplicar el plan.", e)
+    return _iniciar_plan(bg, ref, d, tok, extra=_convo(req.historial))
 
 def _chat_ctx(d):
     plan = [f"{x.get('dia')}: " + ", ".join(e.split(":")[0] for e in x.get("ejercicios", [])[:8]) for x in (d.get("plan_entrenamiento") or [])]
