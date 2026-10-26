@@ -54,67 +54,101 @@ def _cfg(system, json_mode, temp, nivel):
     return types.GenerateContentConfig(**kw)
 
 def ia(contenido, system=None, json_mode=False, temp=0.7, nivel=None):
-    """Devuelve texto. Rota de clave si hay cuota agotada; si el modelo rechaza thinking_level, reintenta sin él."""
     global _idx
     if not CLIENTS:
         raise HTTPException(500, "No hay claves API de Gemini configuradas.")
+    
     for k in range(len(CLIENTS)):
         i = (_idx + k) % len(CLIENTS)
-        for n in ([nivel, None] if nivel else [None]):
-            try:
-                r = CLIENTS[i].models.generate_content(model=MODEL, contents=contenido, config=_cfg(system, json_mode, temp, n))
-                if not r.text:
-                    raise ValueError("respuesta vacía")
-                _idx = i
-                return r.text
-            except Exception as e:
-                s = str(e).lower()
-                if n and "thinking" in s:
-                    continue
-                if any(q in s for q in QUOTA):
-                    print(f"Clave {i} agotada, rotando...")
-                    break
-                raise
+        try:
+            r = CLIENTS[i].models.generate_content(model=MODEL, contents=contenido, config=_cfg(system, json_mode, temp, nivel))
+            if not r.text:
+                raise ValueError("Respuesta vacía por filtro de seguridad.")
+            _idx = i
+            return r.text
+        except Exception as e:
+            s = str(e).lower()
+            # Si el error es por "thinking", reintenta inmediatamente sin thinking
+            if nivel and "thinking" in s:
+                try:
+                    r = CLIENTS[i].models.generate_content(model=MODEL, contents=contenido, config=_cfg(system, json_mode, temp, None))
+                    if r.text:
+                        _idx = i
+                        return r.text
+                except Exception as e2:
+                    s = str(e2).lower()
+            
+            # Si es cuota, lo ignoramos y pasamos a la siguiente clave
+            if any(q in s for q in QUOTA):
+                print(f"Clave {i} agotada (cuota). Rotando...")
+                continue
+            
+            # Si es un error 500, 503 o 504 de Google, rotamos de clave también
+            print(f"Error en clave {i}: {e}. Probando siguiente clave...")
+            continue
+            
     raise HTTPException(429, MSG_CUOTA)
 
 def ia_stream(contenido, system=None, nivel=None):
-    """Generador de fragmentos de texto (para que el chat se vea en vivo)."""
     global _idx
     if not CLIENTS:
         raise HTTPException(500, "No hay claves API de Gemini configuradas.")
+        
     for k in range(len(CLIENTS)):
         i = (_idx + k) % len(CLIENTS)
         emitido = False
-        for n in ([nivel, None] if nivel else [None]):
-            try:
-                for ch in CLIENTS[i].models.generate_content_stream(model=MODEL, contents=contenido, config=_cfg(system, False, 0.7, n)):
-                    if ch.text:
-                        emitido = True
-                        yield ch.text
-                _idx = i
-                return
-            except Exception as e:
-                if emitido:
-                    raise
-                s = str(e).lower()
-                if n and "thinking" in s:
-                    continue
-                if any(q in s for q in QUOTA):
-                    break
-                raise
+        try:
+            for ch in CLIENTS[i].models.generate_content_stream(model=MODEL, contents=contenido, config=_cfg(system, False, 0.7, nivel)):
+                if ch.text:
+                    emitido = True
+                    yield ch.text
+            _idx = i
+            return
+        except Exception as e:
+            if emitido:
+                raise e # Si ya enviamos texto a la app, no podemos rotar sin romper el chat
+            
+            s = str(e).lower()
+            if nivel and "thinking" in s:
+                try:
+                    emitido_reintento = False
+                    for ch in CLIENTS[i].models.generate_content_stream(model=MODEL, contents=contenido, config=_cfg(system, False, 0.7, None)):
+                        if ch.text:
+                            emitido_reintento = True
+                            yield ch.text
+                    _idx = i
+                    return
+                except Exception as e2:
+                    if emitido_reintento:
+                        raise e2
+            
+            print(f"Fallo stream clave {i}: {e}. Rotando...")
+            continue
+            
     raise HTTPException(429, MSG_CUOTA)
 
 def parse_json(t):
-    t = re.sub(r"^```(?:json)?|```$", "", t.strip(), flags=re.M).strip()
+    # Limpieza agresiva de bloques markdown
+    t = re.sub(r"```[a-zA-Z]*\n?(.*?)\n?```", r"\1", t, flags=re.DOTALL).strip()
     try:
         return json.loads(t)
     except Exception:
-        a, b = t.find("{"), t.rfind("}")
+        # Rescate de fuerza bruta: busca tanto {...} como [...]
+        a_obj, b_obj = t.find("{"), t.rfind("}")
+        a_arr, b_arr = t.find("["), t.rfind("]")
+        
+        a = a_obj if a_obj != -1 and (a_arr == -1 or a_obj < a_arr) else a_arr
+        b = b_obj if b_obj != -1 and (b_arr == -1 or b_obj > b_arr) else b_arr
+        
         if a >= 0 and b > a:
-            return json.loads(t[a:b + 1])
-        raise
+            try:
+                return json.loads(t[a:b + 1])
+            except Exception:
+                pass
+        raise ValueError("No se pudo extraer JSON válido del texto.")
 
-def ia_json(contenido, system=None, tries=2, nivel=None):
+def ia_json(contenido, system=None, tries=3, nivel=None): # Aumentamos a 3 reintentos
+    ultimo_error = None
     for i in range(tries):
         try:
             return parse_json(ia(contenido, system, True, 0.6, nivel))
@@ -122,8 +156,9 @@ def ia_json(contenido, system=None, tries=2, nivel=None):
             raise
         except Exception as e:
             print(f"JSON inválido (intento {i + 1}): {e}")
-            if i == tries - 1:
-                raise HTTPException(502, "La IA devolvió una respuesta inválida. Inténtalo de nuevo.")
+            ultimo_error = e
+    # Si falla todas las veces, lanzamos 502 para que el frontend pueda reintentar
+    raise HTTPException(502, f"La IA devolvió un formato inválido: {ultimo_error}")
 
 # ---------- Sesión, suscripción y límites ----------
 def sesion(authorization: Optional[str] = Header(None)):
@@ -525,10 +560,18 @@ def chat_stream(req: BioChatRequest, s=Depends(activo)):
     def gen():
         partes = [primero]
         yield primero
-        for t in g:
-            partes.append(t)
-            yield t
-        _guardar_chat(ref, prev, msg, "".join(partes).strip())
+        try:
+            for t in g:
+                partes.append(t)
+                yield t
+        except Exception as e:
+            print(f"Interrupción en stream: {e}")
+            yield "\n*(El coach tuvo una pequeña interrupción, pero puedes continuar)*"
+            
+        texto_final = "".join(partes).strip()
+        if texto_final:
+            _guardar_chat(ref, prev, msg, texto_final)
+
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.get("/diagnostico")
