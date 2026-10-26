@@ -1,4 +1,4 @@
-import os, io, re, json, time, base64
+import os, io, re, json, time, base64, threading
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,16 +34,28 @@ def get_db():
         raise HTTPException(503, "Base de datos no disponible.")
     return db
 
-# ---------- Gemini (google-genai) con rotación de claves ----------
+# ---------- Gemini (google-genai): reparto entre claves, enfriamiento, reintentos y modelo de respaldo ----------
 KEYS = list(dict.fromkeys(k for k in (os.environ.get("GEMINI_API_KEY1"), os.environ.get("GEMINI_API_KEY2"),
                                       os.environ.get("GEMINI_API_KEY3"), os.environ.get("GEMINI_API_KEY")) if k))
-CLIENTS = [genai.Client(api_key=k) for k in KEYS]  # un cliente por clave: seguro entre hilos, sin bloqueos
+TIMEOUT_MS = int(os.environ.get("IA_TIMEOUT_MS", "60000"))
+
+def _cliente(k):
+    try:
+        return genai.Client(api_key=k, http_options=types.HttpOptions(timeout=TIMEOUT_MS))
+    except Exception:
+        return genai.Client(api_key=k)
+
+CLIENTS = [_cliente(k) for k in KEYS]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+MODELOS = [MODEL] + [m.strip() for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.6-flash").split(",") if m.strip() and m.strip() != MODEL]
 THINK_CHAT = os.environ.get("THINK_CHAT", "low")   # low | medium | high (más alto = más lento)
 THINK_PLAN = os.environ.get("THINK_PLAN", "low")
-_idx = 0
-QUOTA = ("quota", "resource_exhausted", "429", "rate limit")
+PARALELO = os.environ.get("PLAN_PARALELO") == "1"  # 1 = entreno y nutrición en 2 llamadas simultáneas (más rápido, más cuota)
+GATE = threading.BoundedSemaphore(int(os.environ.get("IA_CONCURRENCIA", "3")))  # máx. llamadas simultáneas a Gemini
+COOL = [0.0] * len(CLIENTS)   # hasta cuándo "descansa" cada clave tras un error de cuota
+_rr, _lk = 0, threading.Lock()
 MSG_CUOTA = "En este momento el sistema está procesando muchas solicitudes y las reservas de IA se han agotado temporalmente. Por favor, inténtalo más tarde."
+MSG_SATURADA = "El coach está saturado en este momento. Inténtalo de nuevo en unos segundos."
 
 def _cfg(system, json_mode, temp, nivel):
     kw = {"temperature": temp, "system_instruction": system}
@@ -53,102 +65,118 @@ def _cfg(system, json_mode, temp, nivel):
         kw["thinking_config"] = types.ThinkingConfig(thinking_level=nivel)
     return types.GenerateContentConfig(**kw)
 
+def clasificar(e):
+    """cuota (429) | transitorio (sobrecarga, red, vacío) | fatal (clave o petición mala)."""
+    code, s = getattr(e, "code", None), str(e).lower()
+    if code == 429 or "resource_exhausted" in s or "quota" in s or "rate limit" in s:
+        return "cuota"
+    if code in (500, 502, 503, 504) or any(x in s for x in ("unavailable", "overloaded", "deadline", "timed out", "timeout", "connection", "temporarily", "internal error", "vacía")):
+        return "transitorio"
+    return "fatal"
+
+def espera(e):
+    s = str(e).lower()
+    m = re.search(r"retry in ([\d.]+)\s*s", s) or re.search(r"retrydelay['\": ]+(\d+)s", s)
+    return min(float(m.group(1)), 300) if m else 60.0
+
+def _plan():
+    """Pares (clave, modelo) a probar: reparte entre claves y las que descansan van al final; luego el modelo de respaldo."""
+    global _rr
+    with _lk:
+        n = len(CLIENTS); ini = _rr; _rr = (_rr + 1) % n
+    ahora = time.time()
+    orden = sorted(((ini + k) % n for k in range(n)), key=lambda i: COOL[i] > ahora)
+    for modelo in MODELOS:
+        for i in orden:
+            yield i, modelo
+
+def _registrar(e, i, modelo):
+    tipo = clasificar(e)
+    print(f"IA clave {i} {modelo} [{tipo}]: {str(e)[:200]}")
+    if tipo == "cuota":
+        COOL[i] = time.time() + espera(e)
+    elif tipo == "transitorio":
+        time.sleep(0.5)
+    return tipo
+
+def _esperar(tipos):
+    falta = min(COOL) - time.time()
+    if tipos == {"cuota"} and 0 < falta <= 15:   # el límite por minuto se libera pronto: espera y reintenta una vez
+        time.sleep(falta + 0.2)
+        return True
+    return False
+
+def _final(tipos, ultimo):
+    if "cuota" in tipos:
+        raise HTTPException(429, MSG_CUOTA)
+    if "transitorio" in tipos:
+        raise HTTPException(503, MSG_SATURADA)
+    raise ultimo
+
 def ia(contenido, system=None, json_mode=False, temp=0.7, nivel=None):
-    global _idx
     if not CLIENTS:
         raise HTTPException(500, "No hay claves API de Gemini configuradas.")
-    
-    for k in range(len(CLIENTS)):
-        i = (_idx + k) % len(CLIENTS)
-        try:
-            r = CLIENTS[i].models.generate_content(model=MODEL, contents=contenido, config=_cfg(system, json_mode, temp, nivel))
-            if not r.text:
-                raise ValueError("Respuesta vacía por filtro de seguridad.")
-            _idx = i
-            return r.text
-        except Exception as e:
-            s = str(e).lower()
-            # Si el error es por "thinking", reintenta inmediatamente sin thinking
-            if nivel and "thinking" in s:
+    for ronda in (0, 1):
+        tipos, ultimo = set(), None
+        for i, modelo in _plan():
+            for n in ([nivel, None] if nivel else [None]):
                 try:
-                    r = CLIENTS[i].models.generate_content(model=MODEL, contents=contenido, config=_cfg(system, json_mode, temp, None))
-                    if r.text:
-                        _idx = i
-                        return r.text
-                except Exception as e2:
-                    s = str(e2).lower()
-            
-            # Si es cuota, lo ignoramos y pasamos a la siguiente clave
-            if any(q in s for q in QUOTA):
-                print(f"Clave {i} agotada (cuota). Rotando...")
-                continue
-            
-            # Si es un error 500, 503 o 504 de Google, rotamos de clave también
-            print(f"Error en clave {i}: {e}. Probando siguiente clave...")
+                    with GATE:
+                        r = CLIENTS[i].models.generate_content(model=modelo, contents=contenido, config=_cfg(system, json_mode, temp, n))
+                    if not r.text:
+                        raise ValueError("respuesta vacía")
+                    return r.text
+                except Exception as e:
+                    ultimo = e
+                    if n and "thinking" in str(e).lower():
+                        continue   # el modelo no acepta thinking_level: reintenta sin él
+                    tipos.add(_registrar(e, i, modelo))
+                    break
+        if ronda == 0 and _esperar(tipos):
             continue
-            
-    raise HTTPException(429, MSG_CUOTA)
+        _final(tipos, ultimo)
 
 def ia_stream(contenido, system=None, nivel=None):
-    global _idx
+    """Generador de fragmentos de texto (el chat se ve en vivo). Solo reintenta mientras no haya salido texto."""
     if not CLIENTS:
         raise HTTPException(500, "No hay claves API de Gemini configuradas.")
-        
-    for k in range(len(CLIENTS)):
-        i = (_idx + k) % len(CLIENTS)
-        emitido = False
-        try:
-            for ch in CLIENTS[i].models.generate_content_stream(model=MODEL, contents=contenido, config=_cfg(system, False, 0.7, nivel)):
-                if ch.text:
-                    emitido = True
-                    yield ch.text
-            _idx = i
-            return
-        except Exception as e:
-            if emitido:
-                raise e # Si ya enviamos texto a la app, no podemos rotar sin romper el chat
-            
-            s = str(e).lower()
-            if nivel and "thinking" in s:
+    for ronda in (0, 1):
+        tipos, ultimo = set(), None
+        for i, modelo in _plan():
+            emitido = False
+            for n in ([nivel, None] if nivel else [None]):
                 try:
-                    emitido_reintento = False
-                    for ch in CLIENTS[i].models.generate_content_stream(model=MODEL, contents=contenido, config=_cfg(system, False, 0.7, None)):
-                        if ch.text:
-                            emitido_reintento = True
-                            yield ch.text
-                    _idx = i
+                    with GATE:
+                        for ch in CLIENTS[i].models.generate_content_stream(model=modelo, contents=contenido, config=_cfg(system, False, 0.7, n)):
+                            if ch.text:
+                                emitido = True
+                                yield ch.text
+                    if not emitido:
+                        raise ValueError("respuesta vacía")
                     return
-                except Exception as e2:
-                    if emitido_reintento:
-                        raise e2
-            
-            print(f"Fallo stream clave {i}: {e}. Rotando...")
+                except Exception as e:
+                    if emitido:
+                        raise
+                    ultimo = e
+                    if n and "thinking" in str(e).lower():
+                        continue
+                    tipos.add(_registrar(e, i, modelo))
+                    break
+        if ronda == 0 and _esperar(tipos):
             continue
-            
-    raise HTTPException(429, MSG_CUOTA)
+        _final(tipos, ultimo)
 
 def parse_json(t):
-    # Limpieza agresiva de bloques markdown
-    t = re.sub(r"```[a-zA-Z]*\n?(.*?)\n?```", r"\1", t, flags=re.DOTALL).strip()
+    t = re.sub(r"^```(?:json)?|```$", "", t.strip(), flags=re.M).strip()
     try:
         return json.loads(t)
     except Exception:
-        # Rescate de fuerza bruta: busca tanto {...} como [...]
-        a_obj, b_obj = t.find("{"), t.rfind("}")
-        a_arr, b_arr = t.find("["), t.rfind("]")
-        
-        a = a_obj if a_obj != -1 and (a_arr == -1 or a_obj < a_arr) else a_arr
-        b = b_obj if b_obj != -1 and (b_arr == -1 or b_obj > b_arr) else b_arr
-        
+        a, b = t.find("{"), t.rfind("}")
         if a >= 0 and b > a:
-            try:
-                return json.loads(t[a:b + 1])
-            except Exception:
-                pass
-        raise ValueError("No se pudo extraer JSON válido del texto.")
+            return json.loads(t[a:b + 1])
+        raise
 
-def ia_json(contenido, system=None, tries=3, nivel=None): # Aumentamos a 3 reintentos
-    ultimo_error = None
+def ia_json(contenido, system=None, tries=2, nivel=None):
     for i in range(tries):
         try:
             return parse_json(ia(contenido, system, True, 0.6, nivel))
@@ -156,9 +184,8 @@ def ia_json(contenido, system=None, tries=3, nivel=None): # Aumentamos a 3 reint
             raise
         except Exception as e:
             print(f"JSON inválido (intento {i + 1}): {e}")
-            ultimo_error = e
-    # Si falla todas las veces, lanzamos 502 para que el frontend pueda reintentar
-    raise HTTPException(502, f"La IA devolvió un formato inválido: {ultimo_error}")
+            if i == tries - 1:
+                raise HTTPException(502, "La IA devolvió una respuesta inválida. Inténtalo de nuevo.")
 
 # ---------- Sesión, suscripción y límites ----------
 def sesion(authorization: Optional[str] = Header(None)):
@@ -363,27 +390,35 @@ ENTRENAMIENTO:
 - Formato de cada ejercicio, en una línea: "Nombre: SERIESxREPS · DESCANSOs · RIR n" (ej: "Press banca con barra: 4x6-8 · 120s · RIR 2"). El primer ejercicio de cada día es "Calentamiento: 8 min + series de aproximación".
 - Nombra cada día así: si la disponibilidad indica días concretos de la semana, usa "Lunes: enfoque" con esos días reales; si no, "Día N: enfoque".
 NOTAS: 3-4 líneas sobre progresión (doble progresión), técnica y deload cada 5-6 semanas.
-Devuelve ÚNICAMENTE JSON: {{"rutina": [{{"dia": "Día 1: Torso (empuje)", "ejercicios": ["..."]}}], "notas": "..."}}"""
+"""
     p_nutri = base + """
 
 NUTRICIÓN: escribe SOLO el texto del plan (sin JSON ni recetas) con estas secciones: "✅ PERMITIDOS" (proteínas, carbohidratos y grasas limpias, 3 ejemplos cada una),
 "❌ LIMITAR/EVITAR", "🍽️ DISTRIBUCIÓN" (número de comidas y reparto de macros por comida), "💧 HIDRATACIÓN Y SUPLEMENTOS" (agua y opciones básicas seguras como creatina, con prudencia).
 No incluyas la línea de macros totales; yo la añado."""
 
-    def entreno():
+    esq = 'Devuelve ÚNICAMENTE JSON: {"rutina": [{"dia": "Día 1: Torso (empuje)", "ejercicios": ["..."]}], "notas": "..."%s}'
+
+    def entreno(prompt):
         for _ in range(2):
-            datos = ia_json(p_train, SYS_BASE, nivel=THINK_PLAN)
+            datos = ia_json(prompt, SYS_BASE, nivel=THINK_PLAN)
             try:
-                return normalizar_rutina(datos.get("rutina")), str(datos.get("notas", ""))[:800]
+                return normalizar_rutina(datos.get("rutina")), str(datos.get("notas", ""))[:800], str(datos.get("nutricion") or "")
             except ValueError:
                 continue
         raise HTTPException(502, "No se pudo generar un plan válido. Inténtalo de nuevo.")
 
-    with ThreadPoolExecutor(2) as ex:
-        f1 = ex.submit(entreno)
-        f2 = ex.submit(ia, p_nutri, SYS_BASE, False, 0.6, THINK_PLAN)
-        rutina, notas = f1.result()
-        nutricion = f2.result().strip()
+    if PARALELO:
+        with ThreadPoolExecutor(2) as ex:
+            f1 = ex.submit(entreno, p_train + "\n" + esq % "")
+            f2 = ex.submit(ia, p_nutri, SYS_BASE, False, 0.6, THINK_PLAN)
+            (rutina, notas, _), nutricion = f1.result(), f2.result()
+    else:  # una sola llamada: menos peticiones = menos errores de cuota
+        p_nut = p_nutri[len(base):].replace("escribe SOLO el texto del plan (sin JSON ni recetas)", 'escribe el texto del plan (sin recetas) en el campo "nutricion"')
+        rutina, notas, nutricion = entreno(p_train + "\n" + p_nut + "\n" + esq % ', "nutricion": "..."')
+        if not nutricion.strip():
+            nutricion = ia(p_nutri, SYS_BASE, False, 0.6, THINK_PLAN)
+    nutricion = nutricion.strip()
     nutricion = "\n".join(l for l in nutricion.split("\n") if not l.strip().startswith("📊")).strip()
     nutricion += (f"\n📊 MACROS: Calorías: {mac['kcal']} kcal | Proteína: {mac['proteina']} g | "
                   f"Carbohidratos: {mac['carbos']} g | Grasas: {mac['grasas']} g")
@@ -560,31 +595,23 @@ def chat_stream(req: BioChatRequest, s=Depends(activo)):
     def gen():
         partes = [primero]
         yield primero
-        try:
-            for t in g:
-                partes.append(t)
-                yield t
-        except Exception as e:
-            print(f"Interrupción en stream: {e}")
-            yield "\n*(El coach tuvo una pequeña interrupción, pero puedes continuar)*"
-            
-        texto_final = "".join(partes).strip()
-        if texto_final:
-            _guardar_chat(ref, prev, msg, texto_final)
-
+        for t in g:
+            partes.append(t)
+            yield t
+        _guardar_chat(ref, prev, msg, "".join(partes).strip())
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.get("/diagnostico")
 def diagnostico(k: str = ""):
-    """Comprobación rápida de Firebase y Gemini. Solo responde si defines la variable DIAG_KEY en Render."""
+    """Prueba cada clave por separado. Solo responde si defines la variable DIAG_KEY en Render."""
     clave = os.environ.get("DIAG_KEY")
     if not clave or k != clave:
         raise HTTPException(404, "No encontrado.")
-    out = {"firebase": db is not None, "claves_gemini": len(CLIENTS), "modelo": MODEL, "origenes_permitidos": ORIGINS}
-    try:
-        out["gemini"] = "OK: " + ia("Responde solo: ok", nivel=THINK_CHAT).strip()[:40]
-    except HTTPException as e:
-        out["gemini"] = f"ERROR {e.status_code}: {e.detail}"
-    except Exception as e:
-        out["gemini"] = f"ERROR {type(e).__name__}: {str(e)[:300]}"
+    out = {"firebase": db is not None, "modelos": MODELOS, "origenes_permitidos": ORIGINS, "claves": []}
+    for i, c in enumerate(CLIENTS):
+        try:
+            r = c.models.generate_content(model=MODEL, contents="Responde solo: ok", config=_cfg(None, False, 0.2, THINK_CHAT))
+            out["claves"].append({"clave": i + 1, "estado": "OK: " + (r.text or "").strip()[:30]})
+        except Exception as e:
+            out["claves"].append({"clave": i + 1, "estado": f"ERROR [{clasificar(e)}] {type(e).__name__}: {str(e)[:260]}"})
     return out
