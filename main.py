@@ -433,6 +433,54 @@ No incluyas la línea de macros totales; yo la añado."""
 def home():
     return {"status": "online"}
 
+# ---------- Administración: aprobar y eliminar usuarios ----------
+TREINTA_DIAS_MS = 30 * 24 * 60 * 60 * 1000
+
+def solo_admin(tok=Depends(sesion)):
+    """Solo cuentas con el claim admin=true (se asigna una vez con un script, nunca desde el cliente)."""
+    if tok.get("admin") is not True:
+        raise HTTPException(403, "Solo administradores.")
+    return tok
+
+@app.post("/admin/aprobar")
+def admin_aprobar(body: dict, adm=Depends(solo_admin)):
+    uid = str(body.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(400, "Falta el uid.")
+    try:
+        ref = get_db().collection("usuarios").document(uid)
+        if not ref.get().exists:
+            raise HTTPException(404, "El usuario no existe.")
+        ref.update({"status": "activo", "fecha_vencimiento": int(time.time() * 1000) + TREINTA_DIAS_MS})
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"admin/aprobar: {e}")
+        raise fallo("No se pudo aprobar al usuario.", e)
+
+@app.post("/admin/eliminar")
+def admin_eliminar(body: dict, adm=Depends(solo_admin)):
+    uid = str(body.get("uid") or "").strip()
+    if not uid or uid == adm["uid"]:
+        raise HTTPException(400, "uid inválido.")
+    try:
+        ref = get_db().collection("usuarios").document(uid)
+        try:
+            get_db().recursive_delete(ref)   # borra el documento y sus subcolecciones
+        except AttributeError:
+            ref.delete()                      # versiones antiguas de la librería
+        try:
+            fb_auth.delete_user(uid)          # y la cuenta de acceso (Firebase Auth)
+        except fb_auth.UserNotFoundError:
+            pass
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"admin/eliminar: {e}")
+        raise fallo("No se pudo eliminar al usuario.", e)
+
 @app.post("/analisis-registro")
 def analisis_registro(req: RegistroBioRequest, s=Depends(basico)):
     tok, ref, d = s
@@ -636,44 +684,3 @@ def diagnostico(k: str = ""):
         except Exception as e:
             out["claves"].append({"clave": i + 1, "estado": f"ERROR [{clasificar(e)}] {type(e).__name__}: {str(e)[:260]}"})
     return out
-import time
-from fastapi import Depends, Header, HTTPException
-from firebase_admin import auth, firestore
-
-TREINTA_DIAS_MS = 30 * 24 * 60 * 60 * 1000
-
-def solo_admin(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Falta el token")
-    try:
-        token = auth.verify_id_token(authorization.split(" ", 1)[1])
-    except Exception:
-        raise HTTPException(401, "Token inválido")
-    if token.get("admin") is not True:
-        raise HTTPException(403, "Solo administradores")
-    return token
-
-@app.post("/admin/aprobar")
-def aprobar(body: dict, _=Depends(solo_admin)):
-    uid = body.get("uid")
-    if not uid:
-        raise HTTPException(400, "Falta uid")
-    ref = firestore.client().collection("usuarios").document(uid)
-    if not ref.get().exists:
-        raise HTTPException(404, "El usuario no existe")
-    ref.update({"status": "activo",
-                "fecha_vencimiento": int(time.time() * 1000) + TREINTA_DIAS_MS})
-    return {"ok": True}
-
-@app.post("/admin/eliminar")
-def eliminar(body: dict, admin=Depends(solo_admin)):
-    uid = body.get("uid")
-    if not uid or uid == admin["uid"]:
-        raise HTTPException(400, "uid inválido")
-    db = firestore.client()
-    db.recursive_delete(db.collection("usuarios").document(uid))
-    try:
-        auth.delete_user(uid)
-    except auth.UserNotFoundError:
-        pass
-    return {"ok": True}
