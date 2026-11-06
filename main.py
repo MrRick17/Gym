@@ -296,16 +296,43 @@ def estructura(dias, objetivo):
         return split, "8-12 reps en compuestos, 12-15 en aislamiento, RIR 1-2, descanso 60-90 s, y 10-15 min de cardio (HIIT o LISS) al final de 2-3 días"
     return split, "6-12 reps, RIR 2, descanso 90 s, y cardio ligero de 10 min en 2 días"
 
+def formatear_ejercicio(e):
+    """Convierte un ejercicio estructurado (o un texto antiguo) en la línea que lee la app: 'Nombre: 4x6-8 · 120s · RIR 2'."""
+    if isinstance(e, str):
+        s = e.strip()
+        return s if (not s or ":" in s) else s + ": 3x10"
+    if not isinstance(e, dict):
+        return ""
+    nombre = re.sub(r"\s+", " ", str(e.get("nombre") or "").replace(":", " ")).strip()[:80]
+    if not nombre:
+        return ""
+    try: series = int(float(e.get("series") or 0))
+    except Exception: series = 0
+    try: desc = int(float(e.get("descanso_seg") or 0))
+    except Exception: desc = 0
+    reps = str(e.get("reps") or "").replace("·", " ").replace(":", " ").strip()[:40]
+    if series < 1 or not reps:   # calentamiento, cardio o core por tiempo: texto libre
+        return f"{nombre}: {reps or 'según tolerancia'}"
+    partes = [f"{min(series, 8)}x{reps}"]
+    if desc > 0:
+        partes.append(f"{min(desc, 600)}s")
+    rir = re.search(r"\d", str(e.get("rir") if e.get("rir") is not None else ""))
+    if rir:
+        partes.append(f"RIR {rir.group(0)}")
+    return f"{nombre}: " + " · ".join(partes)
+
 def normalizar_rutina(r):
     if not isinstance(r, list) or not r:
         raise ValueError("rutina vacía")
     out = []
     for dia in r[:7]:
+        if not isinstance(dia, dict):
+            continue
         ejs = []
         for e in (dia.get("ejercicios") or [])[:12]:
-            e = str(e).strip()
+            e = formatear_ejercicio(e)
             if e:
-                ejs.append(e if ":" in e else e + ": 3x10")
+                ejs.append(e)
         if ejs:
             out.append({"dia": str(dia.get("dia") or f"Día {len(out) + 1}").strip(), "ejercicios": ejs})
     if not out:
@@ -387,7 +414,9 @@ ENTRENAMIENTO:
 - 5-6 ejercicios por día (sin contar el calentamiento): compuestos primero, aislamiento después, core o cardio al final. Varía ejercicios entre días y evita rutinas genéricas.
 - 10-20 series semanales por grupo muscular grande; con 4 o más días, cada grupo grande al menos 2 veces por semana.
 - Adapta a género, edad (desde los 45 prioriza ejercicios amigables con las articulaciones), nivel, equipamiento y lesiones. Prioriza lo que pidió el atleta.
-- Formato de cada ejercicio, en una línea: "Nombre: SERIESxREPS · DESCANSOs · RIR n" (ej: "Press banca con barra: 4x6-8 · 120s · RIR 2"). El primer ejercicio de cada día es "Calentamiento: 8 min + series de aproximación".
+- Cada ejercicio es un OBJETO JSON con estos campos: "nombre" (texto corto, sin dos puntos), "series" (entero), "reps" (texto, ej. "6-8"), "descanso_seg" (entero, segundos) y "rir" (entero 0-4).
+  El primer ejercicio de cada día es el calentamiento: {"nombre": "Calentamiento", "series": 0, "reps": "8 min + series de aproximación", "descanso_seg": 0, "rir": null}.
+  Para cardio o core medido en tiempo usa "series": 0 y escribe el tiempo en "reps" (ej. "10 min HIIT").
 - Nombra cada día así: si la disponibilidad indica días concretos de la semana, usa "Lunes: enfoque" con esos días reales; si no, "Día N: enfoque".
 NOTAS: 3-4 líneas sobre progresión (doble progresión), técnica y deload cada 5-6 semanas.
 """
@@ -397,7 +426,8 @@ NUTRICIÓN: escribe SOLO el texto del plan (sin JSON ni recetas) con estas secci
 "❌ LIMITAR/EVITAR", "🍽️ DISTRIBUCIÓN" (número de comidas y reparto de macros por comida), "💧 HIDRATACIÓN Y SUPLEMENTOS" (agua y opciones básicas seguras como creatina, con prudencia).
 No incluyas la línea de macros totales; yo la añado."""
 
-    esq = 'Devuelve ÚNICAMENTE JSON: {"rutina": [{"dia": "Día 1: Torso (empuje)", "ejercicios": ["..."]}], "notas": "..."%s}'
+    esq = ('Devuelve ÚNICAMENTE JSON: {"rutina": [{"dia": "Día 1: Torso (empuje)", "ejercicios": '
+           '[{"nombre": "Press banca con barra", "series": 4, "reps": "6-8", "descanso_seg": 120, "rir": 2}]}], "notas": "..."%s}')
 
     def entreno(prompt):
         for _ in range(2):
