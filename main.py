@@ -227,6 +227,76 @@ def limite(uid, n=12, ventana=60):
         raise HTTPException(429, "Vas muy rápido. Espera unos segundos.")
     _hits[uid] = h + [ahora]
 
+# ---------- Cupos de IA (guardados en Firestore: sobreviven a reinicios y a varias instancias) ----------
+HORA_MS = 3600 * 1000
+CHAT_MAX = int(os.environ.get("CHAT_MAX", "3"))                          # mensajes por ventana
+CHAT_MAX_TRAS_CALIBRAR = int(os.environ.get("CHAT_MAX_TRAS_CALIBRAR", "1"))  # mensajes mientras dura la ventana tras calibrar
+CHAT_VENTANA_H = int(os.environ.get("CHAT_VENTANA_H", "6"))              # horas hasta que se renuevan
+BIO_MAX = int(os.environ.get("BIO_MAX", "8"))                            # mensajes del chat de análisis por ventana
+CAL_MAX_DIA = int(os.environ.get("CAL_MAX_DIA", "3"))                    # calibraciones de plan cada 24 h
+PROG_MAX_DIA = int(os.environ.get("PROG_MAX_DIA", "3"))                  # evaluaciones de progreso cada 24 h
+
+def _norm_cupo(c, ventana_ms, ahora):
+    c = c or {}
+    try:
+        inicio, usados = int(c.get("inicio") or 0), max(0, int(c.get("usados") or 0))
+    except Exception:
+        inicio, usados = 0, 0
+    if inicio <= 0 or ahora - inicio >= ventana_ms:
+        return 0, 0          # ventana vencida: empieza una nueva al próximo uso
+    return inicio, usados
+
+def leer_cupo(c, maximo, ventana_ms, ahora):
+    """Sin consumir. Devuelve (restantes, ms hasta que se renueva)."""
+    inicio, usados = _norm_cupo(c, ventana_ms, ahora)
+    return max(0, maximo - usados), (inicio + ventana_ms - ahora if inicio else 0)
+
+def calc_cupo(c, maximo, ventana_ms, ahora):
+    """Intenta consumir 1. Devuelve (ok, nuevo_estado, restantes, ms hasta renovar)."""
+    inicio, usados = _norm_cupo(c, ventana_ms, ahora)
+    if usados >= maximo:
+        return False, {"inicio": inicio, "usados": usados}, 0, max(0, inicio + ventana_ms - ahora)
+    inicio = inicio or ahora
+    return True, {"inicio": inicio, "usados": usados + 1}, maximo - usados - 1, inicio + ventana_ms - ahora
+
+def fmt_espera(ms):
+    mins = max(1, -(-int(ms) // 60000))
+    h, mn = divmod(mins, 60)
+    return f"{h} h {mn} min" if h and mn else (f"{h} h" if h else f"{mn} min")
+
+def chat_maximo(d, ahora):
+    cal = int(d.get("plan_calibrado_ms") or 0)
+    return CHAT_MAX_TRAS_CALIBRAR if cal and ahora - cal < CHAT_VENTANA_H * HORA_MS else CHAT_MAX
+
+def consumir_cupo(ref, clave, maximo, ventana_ms, aviso):
+    """Consume 1 uso de forma atómica. Si no quedan, responde 429 diciendo cuánto falta."""
+    @firestore.transactional
+    def _tx(tx):
+        d = ref.get(transaction=tx).to_dict() or {}
+        ahora = int(time.time() * 1000)
+        ok, nuevo, rest, renueva = calc_cupo((d.get("ia_cupos") or {}).get(clave), maximo, ventana_ms, ahora)
+        if ok:
+            tx.update(ref, {f"ia_cupos.{clave}": nuevo})
+        return ok, rest, renueva
+    ok, rest, renueva = _tx(get_db().transaction())
+    if not ok:
+        raise HTTPException(429, f"{aviso} Se renuevan en {fmt_espera(renueva)}.")
+    return rest
+
+def devolver_cupo(ref, clave):
+    """Si la IA falla, el usuario no pierde su mensaje."""
+    try:
+        ref.update({f"ia_cupos.{clave}.usados": firestore.Increment(-1)})
+    except Exception as e:
+        print(f"devolver_cupo: {e}")
+
+def reservar(tok, ref, d, clave, maximo, ventana_ms, aviso):
+    """True si se consumió un cupo (los administradores no tienen límite)."""
+    if tok.get("admin") is True:
+        return False
+    consumir_cupo(ref, clave, maximo, ventana_ms, aviso)
+    return True
+
 # ---------- Modelos ----------
 class RutinaRequest(BaseModel):
     uid: Optional[str] = None
@@ -394,7 +464,7 @@ def resumen_analisis(a, peso):
             "masa_muscular": c.get("masa_muscular"), "prioridades": (a or {}).get("prioridades", [])[:3], "resumen": str((a or {}).get("feedback_visual", ""))[:400]}
 
 # ---------- Generador de planes (entreno y nutrición en paralelo) ----------
-def generar_plan(ref, d, objetivo=None, frecuencia=None, peso=None, extra="", analisis=None):
+def generar_plan(ref, d, objetivo=None, frecuencia=None, peso=None, extra="", analisis=None, calibracion=False):
     objetivo = objetivo or d.get("objetivo") or "Recomposición"
     frecuencia = frecuencia or d.get("dias_entrenamiento") or "4 días"
     hist = d.get("historial_pesos") or []
@@ -453,8 +523,13 @@ No incluyas la línea de macros totales; yo la añado."""
     nutricion += (f"\n📊 MACROS: Calorías: {mac['kcal']} kcal | Proteína: {mac['proteina']} g | "
                   f"Carbohidratos: {mac['carbos']} g | Grasas: {mac['grasas']} g")
     macros = {k: mac[k] for k in ("kcal", "proteina", "carbos", "grasas")}
-    ref.update({"plan_entrenamiento": rutina, "plan_nutricion": nutricion, "macros": macros,
-                "plan_notas": notas, "plan_actualizado": firestore.SERVER_TIMESTAMP})
+    upd = {"plan_entrenamiento": rutina, "plan_nutricion": nutricion, "macros": macros,
+           "plan_notas": notas, "plan_actualizado": firestore.SERVER_TIMESTAMP}
+    if calibracion:   # tras calibrar: la ventana del chat se reinicia y solo hay 1 mensaje hasta que pasen las horas
+        ahora = int(time.time() * 1000)
+        upd["plan_calibrado_ms"] = ahora
+        upd["ia_cupos.chat"] = {"inicio": ahora, "usados": 0}
+    ref.update(upd)
     return rutina
 
 # ---------- Endpoints ----------
@@ -471,6 +546,18 @@ def solo_admin(tok=Depends(sesion)):
     if tok.get("admin") is not True:
         raise HTTPException(403, "Solo administradores.")
     return tok
+
+def _borrar_usuario(uid):
+    """Borra el documento (y subcolecciones) y la cuenta de acceso de Firebase Auth."""
+    ref = get_db().collection("usuarios").document(uid)
+    try:
+        get_db().recursive_delete(ref)
+    except AttributeError:   # versiones antiguas de la librería
+        ref.delete()
+    try:
+        fb_auth.delete_user(uid)
+    except fb_auth.UserNotFoundError:
+        pass
 
 @app.post("/admin/aprobar")
 def admin_aprobar(body: dict, adm=Depends(solo_admin)):
@@ -495,21 +582,49 @@ def admin_eliminar(body: dict, adm=Depends(solo_admin)):
     if not uid or uid == adm["uid"]:
         raise HTTPException(400, "uid inválido.")
     try:
-        ref = get_db().collection("usuarios").document(uid)
-        try:
-            get_db().recursive_delete(ref)   # borra el documento y sus subcolecciones
-        except AttributeError:
-            ref.delete()                      # versiones antiguas de la librería
-        try:
-            fb_auth.delete_user(uid)          # y la cuenta de acceso (Firebase Auth)
-        except fb_auth.UserNotFoundError:
-            pass
+        _borrar_usuario(uid)
         return {"status": "success"}
     except HTTPException:
         raise
     except Exception as e:
         print(f"admin/eliminar: {e}")
         raise fallo("No se pudo eliminar al usuario.", e)
+
+# ---------- Prueba gratuita y cuenta propia ----------
+TRIAL_DIAS = 7
+
+@app.post("/iniciar-prueba")
+def iniciar_prueba(s=Depends(basico)):
+    """Activa los días de prueba una sola vez por cuenta, y solo con el correo verificado."""
+    tok, ref, d = s
+    if not tok.get("email_verified"):
+        raise HTTPException(403, "Primero verifica tu correo electrónico.")
+    if d.get("status") == "activo":
+        return {"status": "success"}
+    if d.get("prueba_usada"):
+        raise HTTPException(409, "Ya usaste tu prueba gratuita.")
+    try:
+        ahora = int(time.time() * 1000)
+        ref.update({"status": "activo", "prueba_usada": True, "prueba_inicio": ahora,
+                    "fecha_vencimiento": ahora + TRIAL_DIAS * 24 * 60 * 60 * 1000})
+        return {"status": "success"}
+    except Exception as e:
+        print(f"iniciar-prueba: {e}")
+        raise fallo("No se pudo activar la prueba.", e)
+
+@app.post("/eliminar-mi-cuenta")
+def eliminar_mi_cuenta(tok=Depends(sesion)):
+    """El usuario borra su cuenta y todos sus datos (derecho de eliminación)."""
+    if tok.get("admin") is True:
+        raise HTTPException(400, "Una cuenta de administrador no se elimina desde aquí.")
+    try:
+        _borrar_usuario(tok["uid"])
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"eliminar-mi-cuenta: {e}")
+        raise fallo("No se pudo eliminar la cuenta.", e)
 
 @app.post("/analisis-registro")
 def analisis_registro(req: RegistroBioRequest, s=Depends(basico)):
@@ -543,7 +658,7 @@ def _estado(ref, jid, estado, msg=""):
     except Exception as e:
         print(f"plan_estado: {e}")
 
-def _trabajo_plan(ref, d, jid, **kw):
+def _trabajo_plan(ref, d, jid, reembolso=False, **kw):
     """Corre en segundo plano: reintenta si la IA falla y deja el resultado en Firestore para que el front lo lea."""
     msg = "No se pudo generar el plan. Inténtalo de nuevo."
     for intento in (0, 1):
@@ -563,26 +678,30 @@ def _trabajo_plan(ref, d, jid, **kw):
                 continue
             break
     _estado(ref, jid, "error", msg)
+    if reembolso:
+        devolver_cupo(ref, "calibrar")
 
 def _iniciar_plan(bg, ref, d, tok, **kw):
     est = d.get("plan_estado") or {}
     if est.get("estado") == "generando" and time.time() * 1000 - est.get("ts", 0) < 240000:
         return {"status": "en_curso", "job": est.get("id")}
     limite(tok["uid"], 4, 300)
+    cobrado = reservar(tok, ref, d, "calibrar", CAL_MAX_DIA, 24 * HORA_MS, "Ya calibraste tu plan varias veces hoy.")
     jid = str(int(time.time() * 1000))
     _estado(ref, jid, "generando")
-    bg.add_task(_trabajo_plan, ref, d, jid, **kw)
+    bg.add_task(_trabajo_plan, ref, d, jid, reembolso=cobrado, **kw)
     return {"status": "iniciado", "job": jid}
 
 @app.post("/generar-rutina")
 def generar_rutina(req: RutinaRequest, bg: BackgroundTasks, s=Depends(activo)):
     tok, ref, d = s
-    return _iniciar_plan(bg, ref, d, tok)
+    return _iniciar_plan(bg, ref, d, tok, calibracion=True)
 
 @app.post("/evaluar-progreso")
 def evaluar_progreso(req: ProgresoRequest, s=Depends(activo)):
     tok, ref, d = s
     limite(tok["uid"], 4, 300)
+    cobrado = reservar(tok, ref, d, "progreso", PROG_MAX_DIA, 24 * HORA_MS, "Ya evaluaste tu progreso varias veces hoy.")
     try:
         hist = list(d.get("historial_pesos") or [])
         feedback = None
@@ -603,9 +722,11 @@ def evaluar_progreso(req: ProgresoRequest, s=Depends(activo)):
         ref.update({"historial_pesos": hist})
         return {"status": "success", "feedback": str(feedback).strip()}
     except HTTPException:
+        if cobrado: devolver_cupo(ref, "progreso")
         raise
     except Exception as e:
         print(f"evaluar-progreso: {e}")
+        if cobrado: devolver_cupo(ref, "progreso")
         raise fallo("No se pudo evaluar el progreso.", e)
 
 def _convo(h):
@@ -615,21 +736,24 @@ def _convo(h):
 def chat_biometrico(req: BioChatRequest, s=Depends(activo)):
     tok, ref, d = s
     limite(tok["uid"])
+    cobrado = reservar(tok, ref, d, "bio", BIO_MAX, CHAT_VENTANA_H * HORA_MS, "Ya usaste los mensajes de este análisis.")
     try:
         p = (f"Estás en el análisis físico de {str(d.get('nombre', 'Atleta')).split(' ')[0]} (objetivo: {d.get('objetivo', '')}). "
              f"Historial (datos):\n{_convo(req.historial)}\nAtleta dice: <<<{req.nuevo_mensaje[:600]}>>>\n"
              "Responde en 1-2 líneas, confirmando lo que priorizarás en su plan. Sé carismático y concreto.")
         return {"status": "success", "respuesta": ia(p, SYS_BASE, nivel=THINK_CHAT).strip()}
     except HTTPException:
+        if cobrado: devolver_cupo(ref, "bio")
         raise
     except Exception as e:
         print(f"chat-biometrico: {e}")
+        if cobrado: devolver_cupo(ref, "bio")
         raise fallo("No pude responder ahora.", e)
 
 @app.post("/aplicar-plan-biometrico")
 def aplicar_plan(req: AplicarPlanRequest, bg: BackgroundTasks, s=Depends(activo)):
     tok, ref, d = s
-    return _iniciar_plan(bg, ref, d, tok, extra=_convo(req.historial))
+    return _iniciar_plan(bg, ref, d, tok, extra=_convo(req.historial), calibracion=True)
 
 def _chat_ctx(d):
     plan = [f"{x.get('dia')}: " + ", ".join(e.split(":")[0] for e in x.get("ejercicios", [])[:8]) for x in (d.get("plan_entrenamiento") or [])]
@@ -657,20 +781,42 @@ def _msg(req):
         raise HTTPException(400, "Mensaje vacío.")
     return msg
 
+def _reservar_chat(tok, ref, d):
+    ahora = int(time.time() * 1000)
+    maximo = chat_maximo(d, ahora)
+    aviso = ("Ya usaste tu mensaje con el coach después de calibrar tu plan." if maximo == CHAT_MAX_TRAS_CALIBRAR < CHAT_MAX
+             else "Ya usaste tus mensajes con el coach.")
+    return reservar(tok, ref, d, "chat", maximo, CHAT_VENTANA_H * HORA_MS, aviso)
+
+@app.get("/cupo-chat")
+def cupo_chat(s=Depends(basico)):
+    """Cuántos mensajes le quedan al usuario y cuándo se renuevan (no consume nada)."""
+    tok, ref, d = s
+    if tok.get("admin") is True:
+        return {"ilimitado": True, "restantes": 99, "maximo": 99, "renueva_en_s": 0, "tras_calibrar": False}
+    ahora = int(time.time() * 1000)
+    maximo = chat_maximo(d, ahora)
+    rest, renueva = leer_cupo((d.get("ia_cupos") or {}).get("chat"), maximo, CHAT_VENTANA_H * HORA_MS, ahora)
+    return {"ilimitado": False, "restantes": rest, "maximo": maximo, "renueva_en_s": int(renueva / 1000),
+            "tras_calibrar": maximo == CHAT_MAX_TRAS_CALIBRAR < CHAT_MAX}
+
 @app.post("/chat")
 def chat_asistente(req: BioChatRequest, s=Depends(activo)):
     tok, ref, d = s
     limite(tok["uid"])
     msg = _msg(req)
+    cobrado = _reservar_chat(tok, ref, d)
     try:
         system, prev = _chat_ctx(d)
         r = ia(_chat_prompt(prev, msg), system, nivel=THINK_CHAT).strip()
         _guardar_chat(ref, prev, msg, r)
         return {"status": "success", "respuesta": r}
     except HTTPException:
+        if cobrado: devolver_cupo(ref, "chat")
         raise
     except Exception as e:
         print(f"chat: {e}")
+        if cobrado: devolver_cupo(ref, "chat")
         raise fallo("No pude responder ahora.", e)
 
 @app.post("/chat-stream")
@@ -679,16 +825,20 @@ def chat_stream(req: BioChatRequest, s=Depends(activo)):
     tok, ref, d = s
     limite(tok["uid"])
     msg = _msg(req)
+    cobrado = _reservar_chat(tok, ref, d)
     try:
         system, prev = _chat_ctx(d)
         g = ia_stream(_chat_prompt(prev, msg), system, THINK_CHAT)
         primero = next(g)  # si falla (cuota, error) se informa aquí con el código HTTP correcto
     except HTTPException:
+        if cobrado: devolver_cupo(ref, "chat")
         raise
     except StopIteration:
+        if cobrado: devolver_cupo(ref, "chat")
         raise HTTPException(502, "Respuesta vacía.")
     except Exception as e:
         print(f"chat-stream: {e}")
+        if cobrado: devolver_cupo(ref, "chat")
         raise fallo("No pude responder ahora.", e)
 
     def gen():
