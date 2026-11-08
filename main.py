@@ -8,7 +8,7 @@ from firebase_admin import credentials, firestore, auth as fb_auth
 from google import genai
 from google.genai import types
 from concurrent.futures import ThreadPoolExecutor
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 try:
     from PIL import Image, ImageOps
 except Exception:
@@ -16,6 +16,15 @@ except Exception:
 
 app = FastAPI(title="CORE Fitness AI Backend")
 ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+@app.middleware("http")
+async def capturar_errores(request, call_next):
+    """Debe ir ANTES del CORS: así un error inesperado también lleva cabeceras CORS y el navegador muestra el motivo real."""
+    try:
+        return await call_next(request)
+    except Exception as e:
+        print(f"ERROR no controlado en {request.method} {request.url.path}: {type(e).__name__}: {e}")
+        return JSONResponse({"detail": "Error interno del servidor."}, status_code=500)
+
 app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 # ---------- Firebase ----------
@@ -294,15 +303,23 @@ def reservar(tok, ref, d, clave, maximo, ventana_ms, aviso):
     """True si se consumió un cupo (los administradores no tienen límite)."""
     if tok.get("admin") is True:
         return False
-    consumir_cupo(ref, clave, maximo, ventana_ms, aviso)
+    try:
+        consumir_cupo(ref, clave, maximo, ventana_ms, aviso)
+    except HTTPException:
+        raise
+    except Exception as e:   # un fallo del contador no debe dejar sin servicio al usuario
+        print(f"CUPO '{clave}' no se pudo verificar: {type(e).__name__}: {e}")
+        return False
     return True
 
 # ---------- Modelos ----------
 class RutinaRequest(BaseModel):
     uid: Optional[str] = None
+    catalogo: list[str] = []
 
 class RegistroBioRequest(BaseModel):
     uid: Optional[str] = None
+    catalogo: list[str] = []
     peso: float = Field(ge=30, le=300)
     frecuencia: str
     objetivo: str
@@ -325,6 +342,7 @@ class BioChatRequest(BaseModel):
 
 class AplicarPlanRequest(BaseModel):
     uid: Optional[str] = None
+    catalogo: list[str] = []
     historial: list[MensajeBio] = []
 
 # ---------- Ciencia del entrenamiento y la nutrición ----------
@@ -464,7 +482,7 @@ def resumen_analisis(a, peso):
             "masa_muscular": c.get("masa_muscular"), "prioridades": (a or {}).get("prioridades", [])[:3], "resumen": str((a or {}).get("feedback_visual", ""))[:400]}
 
 # ---------- Generador de planes (entreno y nutrición en paralelo) ----------
-def generar_plan(ref, d, objetivo=None, frecuencia=None, peso=None, extra="", analisis=None, calibracion=False):
+def generar_plan(ref, d, objetivo=None, frecuencia=None, peso=None, extra="", analisis=None, calibracion=False, catalogo=None):
     objetivo = objetivo or d.get("objetivo") or "Recomposición"
     frecuencia = frecuencia or d.get("dias_entrenamiento") or "4 días"
     hist = d.get("historial_pesos") or []
@@ -472,6 +490,10 @@ def generar_plan(ref, d, objetivo=None, frecuencia=None, peso=None, extra="", an
     dias = contar_dias(frecuencia)
     mac = metabolismo(d, peso, dias, objetivo)
     split, pautas = estructura(dias, objetivo)
+    nombres = [re.sub(r"\s+", " ", str(n)).strip()[:60] for n in (catalogo or [])[:150] if str(n).strip()]
+    bloque_cat = ("\n- EJERCICIOS CON DEMOSTRACIÓN EN LA APP: " + " | ".join(nombres) +
+                  ". Cuando uno encaje con el objetivo, nivel, equipamiento y lesiones del atleta, úsalo con su nombre EXACTO. "
+                  "No te limites a esta lista ni fuerces ejercicios que no encajen.") if nombres else ""
     base = f"""Diseña un plan TOTALMENTE PERSONALIZADO.
 PERFIL: {perfil(d, peso, objetivo, frecuencia)}
 ANÁLISIS FÍSICO: {json.dumps(analisis or d.get('ultimo_analisis') or {}, ensure_ascii=False)[:1500]}
@@ -485,9 +507,10 @@ ENTRENAMIENTO:
 - 10-20 series semanales por grupo muscular grande; con 4 o más días, cada grupo grande al menos 2 veces por semana.
 - Adapta a género, edad (desde los 45 prioriza ejercicios amigables con las articulaciones), nivel, equipamiento y lesiones. Prioriza lo que pidió el atleta.
 - Cada ejercicio es un OBJETO JSON con estos campos: "nombre" (texto corto, sin dos puntos), "series" (entero), "reps" (texto, ej. "6-8"), "descanso_seg" (entero, segundos) y "rir" (entero 0-4).
-  El primer ejercicio de cada día es el calentamiento: {"nombre": "Calentamiento", "series": 0, "reps": "8 min + series de aproximación", "descanso_seg": 0, "rir": null}.
+  El primer ejercicio de cada día es el calentamiento: {{"nombre": "Calentamiento", "series": 0, "reps": "8 min + series de aproximación", "descanso_seg": 0, "rir": null}}.
   Para cardio o core medido en tiempo usa "series": 0 y escribe el tiempo en "reps" (ej. "10 min HIIT").
 - Nombra cada día así: si la disponibilidad indica días concretos de la semana, usa "Lunes: enfoque" con esos días reales; si no, "Día N: enfoque".
+{bloque_cat}
 NOTAS: 3-4 líneas sobre progresión (doble progresión), técnica y deload cada 5-6 semanas.
 """
     p_nutri = base + """
@@ -639,7 +662,7 @@ def analisis_registro(req: RegistroBioRequest, s=Depends(basico)):
             analisis = ia_json([prompt_fotos(d, req.peso, req.objetivo, None)] + fotos, SYS_FOTOS, nivel=THINK_PLAN)
             if analisis.get("foto_valida") is False:
                 return {"status": "warning", "message": "Atleta registrado, pero las fotos fueron rechazadas."}
-        generar_plan(ref, d, req.objetivo, req.frecuencia, req.peso, analisis=analisis)
+        generar_plan(ref, d, req.objetivo, req.frecuencia, req.peso, analisis=analisis, catalogo=req.catalogo)
         upd = {"analisis_inicial_hecho": True}
         if analisis:
             r = resumen_analisis(analisis, req.peso)
@@ -695,7 +718,7 @@ def _iniciar_plan(bg, ref, d, tok, **kw):
 @app.post("/generar-rutina")
 def generar_rutina(req: RutinaRequest, bg: BackgroundTasks, s=Depends(activo)):
     tok, ref, d = s
-    return _iniciar_plan(bg, ref, d, tok, calibracion=True)
+    return _iniciar_plan(bg, ref, d, tok, calibracion=True, catalogo=req.catalogo)
 
 @app.post("/evaluar-progreso")
 def evaluar_progreso(req: ProgresoRequest, s=Depends(activo)):
@@ -753,7 +776,7 @@ def chat_biometrico(req: BioChatRequest, s=Depends(activo)):
 @app.post("/aplicar-plan-biometrico")
 def aplicar_plan(req: AplicarPlanRequest, bg: BackgroundTasks, s=Depends(activo)):
     tok, ref, d = s
-    return _iniciar_plan(bg, ref, d, tok, extra=_convo(req.historial), calibracion=True)
+    return _iniciar_plan(bg, ref, d, tok, extra=_convo(req.historial), calibracion=True, catalogo=req.catalogo)
 
 def _chat_ctx(d):
     plan = [f"{x.get('dia')}: " + ", ".join(e.split(":")[0] for e in x.get("ejercicios", [])[:8]) for x in (d.get("plan_entrenamiento") or [])]
@@ -795,8 +818,12 @@ def cupo_chat(s=Depends(basico)):
     if tok.get("admin") is True:
         return {"ilimitado": True, "restantes": 99, "maximo": 99, "renueva_en_s": 0, "tras_calibrar": False}
     ahora = int(time.time() * 1000)
-    maximo = chat_maximo(d, ahora)
-    rest, renueva = leer_cupo((d.get("ia_cupos") or {}).get("chat"), maximo, CHAT_VENTANA_H * HORA_MS, ahora)
+    try:
+        maximo = chat_maximo(d, ahora)
+        rest, renueva = leer_cupo((d.get("ia_cupos") or {}).get("chat"), maximo, CHAT_VENTANA_H * HORA_MS, ahora)
+    except Exception as e:
+        print(f"cupo-chat: {e}")
+        maximo, rest, renueva = CHAT_MAX, CHAT_MAX, 0
     return {"ilimitado": False, "restantes": rest, "maximo": maximo, "renueva_en_s": int(renueva / 1000),
             "tras_calibrar": maximo == CHAT_MAX_TRAS_CALIBRAR < CHAT_MAX}
 
